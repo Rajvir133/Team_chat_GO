@@ -31,7 +31,7 @@ func SendHandler(w http.ResponseWriter, r *http.Request) {
 
 	log.Printf("[HTTP] /send request from %s to %s (%s)\n", msg.Sender, msg.Receiver, msg.MessageType)
 
-	if err := transfer.SendMessage(msg, config.TCPPort); err != nil {
+	if err := transfer.SendFileTCP(msg); err != nil {
 		http.Error(w, fmt.Sprintf("Send failed: %v", err), http.StatusInternalServerError)
 		return
 	}

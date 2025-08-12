@@ -1,159 +1,66 @@
 package transfer
 
 import (
+	"bufio"
 	"bytes"
-	"compress/zlib"
-	"crypto/sha256"
 	"encoding/binary"
-	"encoding/json"
 	"fmt"
-	"go_files/config"
-	"log"
 	"net"
-	"strings"
 	"time"
+
+	"go_files/config"
 )
 
-// SendUDPChunksFromBytes sends already-loaded data over UDP
-func SendUDPChunks(conn net.Conn, metadata config.FileMetadata, data []byte) error {
-	return sendUDPChunksCore(conn, metadata, data)
-}
-
-// Core function that handles compression, hashing, chunking, and UDP sending
-func sendUDPChunksCore(conn net.Conn, metadata config.FileMetadata, data []byte) error {
-	// Compress if not already compressed type
-	if !config.NoCompressionTypes[metadata.Type] {
-		var buf bytes.Buffer
-		zw := zlib.NewWriter(&buf)
-		if _, err := zw.Write(data); err != nil {
-			return fmt.Errorf("zlib write error: %v", err)
-		}
-		zw.Close()
-		data = buf.Bytes()
-	}
-
-	// Calculate hash
-	hash := sha256.Sum256(data)
-	metadata.Hash = fmt.Sprintf("%x", hash[:])
-
-	// Split into chunks
-	chunks := splitIntoChunks(data, config.ChunkSize)
-	metadata.Chunks = len(chunks)
-
-	// Send metadata over TCP
-	metaBytes, _ := json.Marshal(metadata)
-	log.Printf("[📤] Sending metadata over TCP: %s (%d bytes, %d chunks)",
-		metadata.Name, metadata.Size, metadata.Chunks)
-	conn.Write(append(metaBytes, '\n'))
-
-	// Wait for UDP start signal
-	log.Printf("[⏳] Waiting for UDP start signal from receiver...")
-	tcpAck := make([]byte, 64)
-	n, err := conn.Read(tcpAck)
-	if err != nil {
-		return fmt.Errorf("failed to read UDP start signal: %v", err)
-	}
-	ackMsg := string(tcpAck[:n])
-	log.Printf("[📥] Received TCP response: %q", strings.TrimSpace(ackMsg))
-
-	// Parse the dynamic UDP port from response
-	if len(ackMsg) < 6 || ackMsg[:6] != "Start:" {
-		return fmt.Errorf("unexpected start message: %s", ackMsg)
-	}
-
-	var udpPort int
-	fmt.Sscanf(ackMsg, "Start:%d\n", &udpPort)
-	log.Printf("[→] Receiver allocated UDP port: %d", udpPort)
-
-	udpAddr := &net.UDPAddr{IP: net.ParseIP(metadata.Receiver), Port: udpPort}
-	udpConn, err := net.DialUDP("udp", nil, udpAddr)
-	if err != nil {
-		return fmt.Errorf("UDP dial error: %v", err)
-	}
+func SendFileChunksUDP(connTCP net.Conn, receiverIP string, udpPort int, fileHash [32]byte, data []byte, totalChunks int) error {
+	udpAddr, _ := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", receiverIP, udpPort))
+	udpConn, _ := net.DialUDP("udp", nil, udpAddr)
 	defer udpConn.Close()
 
-	// Enhanced logging: Track start time and progress
-	startTime := time.Now()
-	log.Printf("[📤] Starting transfer of %s (%d chunks, %d bytes) to %s:%d",
-		metadata.Name, len(chunks), len(data), metadata.Receiver, udpPort)
+	reader := bufio.NewReader(connTCP)
 
-	// Send chunks with detailed logging
-	for idx, chunk := range chunks {
-		chunkStartTime := time.Now()
-
-		buf := new(bytes.Buffer)
-		buf.Write(hash[:])                                       // File hash
-		binary.Write(buf, binary.BigEndian, uint32(idx+1))       // Chunk index
-		binary.Write(buf, binary.BigEndian, uint32(len(chunks))) // Total chunks
-		binary.Write(buf, binary.BigEndian, uint32(len(chunk)))  // Chunk size
-		buf.Write(chunk)                                         // Chunk data
-
-		if _, err := udpConn.Write(buf.Bytes()); err != nil {
-			return fmt.Errorf("UDP send error for chunk %d: %v", idx+1, err)
-		}
-
-		// Log chunk sent with progress
-		chunkDuration := time.Since(chunkStartTime)
-		log.Printf("[📦] Chunk %d/%d sent (%d bytes) in %v",
-			idx+1, len(chunks), len(chunk), chunkDuration)
-
-		// Wait for TCP acknowledgment for this chunk
-		ackBuffer := make([]byte, 64)
-		ackStartTime := time.Now()
-		n, err := conn.Read(ackBuffer)
-		ackDuration := time.Since(ackStartTime)
-
-		if err != nil {
-			return fmt.Errorf("failed to read ACK for chunk %d: %v", idx+1, err)
-		}
-
-		ackMsg := string(ackBuffer[:n])
-		log.Printf("[✅] Chunk %d/%d ACK received: %s (in %v)",
-			idx+1, len(chunks), strings.TrimSpace(ackMsg), ackDuration)
-
-		// Verify ACK format
-		expectedAck := fmt.Sprintf("chunk%d received", idx+1)
-		if !strings.Contains(ackMsg, expectedAck) {
-			log.Printf("[⚠️] Unexpected ACK for chunk %d: expected '%s', got '%s'",
-				idx+1, expectedAck, strings.TrimSpace(ackMsg))
-		}
-
-		time.Sleep(10 * time.Millisecond) // pacing
-	}
-
-	totalDuration := time.Since(startTime)
-	log.Printf("[✓] All %d chunks sent successfully to %s:%d in %v",
-		len(chunks), metadata.Receiver, udpPort, totalDuration)
-
-	// Wait for final TCP ACK
-	finalAck := make([]byte, 64)
-	n, err = conn.Read(finalAck)
-	if err != nil {
-		return fmt.Errorf("failed to read final ACK: %v", err)
-	}
-
-	finalMsg := string(finalAck[:n])
-	if finalMsg == "ERROR:HASH_MISMATCH\n" {
-		return fmt.Errorf("hash mismatch reported by receiver")
-	}
-	if finalMsg != "stop\n" {
-		return fmt.Errorf("unexpected final ACK: %s", finalMsg)
-	}
-
-	log.Printf("[🎯] Final ACK received: %s", strings.TrimSpace(finalMsg))
-	log.Println("[✓] File transfer complete")
-	return nil
-}
-
-// splitIntoChunks splits data into fixed-size chunks
-func splitIntoChunks(data []byte, size int) [][]byte {
-	var chunks [][]byte
-	for i := 0; i < len(data); i += size {
-		end := i + size
+	for i := 1; i <= totalChunks; i++ {
+		start := (i - 1) * config.ChunkSize
+		end := start + config.ChunkSize
 		if end > len(data) {
 			end = len(data)
 		}
-		chunks = append(chunks, data[i:end])
+		chunkData := data[start:end]
+
+		var header bytes.Buffer
+		header.Write(fileHash[:])
+		binary.Write(&header, binary.BigEndian, uint32(i))
+		binary.Write(&header, binary.BigEndian, uint32(totalChunks))
+		binary.Write(&header, binary.BigEndian, uint32(len(chunkData)))
+
+		packet := append(header.Bytes(), chunkData...)
+
+		// Send-with-ACK loop: do not proceed to next chunk until proper ACK
+		ackReceived := false
+		maxRetries := 1
+		for attempt := 0; attempt <= maxRetries; attempt++ {
+			_, err := udpConn.Write(packet)
+			if err != nil {
+				return fmt.Errorf("failed to send UDP chunk %d: %v", i, err)
+			}
+			fmt.Printf("[UDP] send chunk %d\n", i)
+
+			connTCP.SetReadDeadline(time.Now().Add(10 * time.Second))
+			ack, err := reader.ReadString('\n')
+			if err == nil && ack == fmt.Sprintf("chunk%d\n", i) {
+				fmt.Printf("[UDP] ack of chunk %d received\n", i)
+				ackReceived = true
+				break
+			}
+			if err != nil {
+				fmt.Printf("[logs] ack wait error for chunk %d (attempt %d): %v\n", i, attempt+1, err)
+			} else {
+				fmt.Printf("[logs] unexpected ack for chunk %d (attempt %d): %q\n", i, attempt+1, ack)
+			}
+			// retry will re-send the same chunk
+		}
+		if !ackReceived {
+			return fmt.Errorf("[log]no ACK for chunk %d after retries", i)
+		}
 	}
-	return chunks
+	return nil
 }

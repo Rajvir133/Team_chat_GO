@@ -8,83 +8,72 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
-	"strings"
 
 	"go_files/config"
 )
 
-
-
-
-// SendMessage sends either a file or text message
-func SendMessage(msg config.Message, tcpPort int) error {
-	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", msg.Receiver, tcpPort))
+func SendFileTCP(msg config.Message) error {
+	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", msg.Receiver, config.TCPPort))
 	if err != nil {
-		return fmt.Errorf("TCP connect failed: %v", err)
+		return fmt.Errorf("TCP connect error: %v", err)
 	}
 	defer conn.Close()
 
-	bufWriter := bufio.NewWriter(conn)
+	fmt.Printf("send request from %s to %s\n", msg.Sender, msg.Receiver)
+
 	reader := bufio.NewReader(conn)
+	writer := bufio.NewWriter(conn)
 
-	if msg.MessageType == "image" || msg.MessageType == "video" {
-		for _, file := range msg.Payload {
-			rawBytes, err := config.DecodeBase64(file.Data)
-			if err != nil {
-				return fmt.Errorf("base64 decode error: %v", err)
-			}
+	file := msg.Payload[0]
+	rawBytes, _ := config.DecodeBase64(file.Data)
 
-			var compressedData []byte
-			if config.NoCompressionTypes[file.Type] || len(rawBytes) < 1024 {
-				compressedData = rawBytes
-			} else {
-				var compressed bytes.Buffer
-				zlibWriter := zlib.NewWriter(&compressed)
-				if _, err = zlibWriter.Write(rawBytes); err != nil {
-					return fmt.Errorf("compression error: %v", err)
-				}
-				zlibWriter.Close()
-				compressedData = compressed.Bytes()
-			}
-
-			hash := sha256.Sum256(compressedData)
-			chunks := config.CalculateChunks(len(compressedData))
-			metadata := config.FileMetadata{
-				Name:     file.Name,
-				Type:     file.Type,
-				Size:     len(compressedData),
-				Chunks:   chunks,
-				Hash:     fmt.Sprintf("%x", hash[:]),
-				Sender:   msg.Sender,
-				Receiver: msg.Receiver,
-			}
-
-			metaBytes, _ := json.Marshal(metadata)
-			bufWriter.Write(append(metaBytes, '\n'))
-			bufWriter.Flush()
-
-			response, err := reader.ReadString('\n')
-			if err != nil {
-				return fmt.Errorf("failed to read start response: %v", err)
-			}
-			response = strings.TrimSpace(response)
-			if strings.HasPrefix(response, "ERROR:") {
-				return fmt.Errorf("receiver error: %s", response)
-			}
-
-			var udpPort int
-			if _, err := fmt.Sscanf(response, "Start:%d", &udpPort); err != nil {
-				return fmt.Errorf("invalid start response: %q", response)
-			}
-
-			if err := SendUDPChunks(conn, metadata, compressedData); err != nil {
-				return err
-			}
-		}
-		return nil
+	var compressedData []byte
+	if config.NoCompressionTypes[file.Type] {
+		compressedData = rawBytes
+	} else {
+		var buf bytes.Buffer
+		w := zlib.NewWriter(&buf)
+		w.Write(rawBytes)
+		w.Close()
+		compressedData = buf.Bytes()
 	}
 
-	jsonData, _ := json.Marshal(msg)
-	_, err = conn.Write(append(jsonData, '\n'))
-	return err
+	hash := sha256.Sum256(compressedData)
+	hashHex := fmt.Sprintf("%x", hash[:])
+	chunks := config.CalculateChunks(len(compressedData))
+
+	metadata := config.FileMetadata{
+		Name:     file.Name,
+		Type:     file.Type,
+		Size:     len(compressedData),
+		Chunks:   chunks,
+		Hash:     hashHex,
+		Sender:   msg.Sender,
+		Receiver: msg.Receiver,
+	}
+
+	metaBytes, _ := json.Marshal(metadata)
+	writer.Write(append(metaBytes, '\n'))
+	writer.Flush()
+
+	startLine, _ := reader.ReadString('\n')
+	if len(startLine) == 0 {
+		return fmt.Errorf("no Start signal from receiver")
+	}
+	var udpPort int
+	fmt.Sscanf(startLine, "Start:%d\n", &udpPort)
+	fmt.Printf("[TCP]received start : %d\n", udpPort)
+
+	err = SendFileChunksUDP(conn, msg.Receiver, udpPort, hash, compressedData, chunks)
+	if err != nil {
+		return err
+	}
+
+	stopLine, _ := reader.ReadString('\n')
+	if stopLine == "stop\n" {
+		fmt.Println("[TCP]received : stop")
+		fmt.Println("[log]sent successfully")
+	}
+
+	return nil
 }
