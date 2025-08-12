@@ -1,6 +1,7 @@
 from fastapi import FastAPI
 from app.models import Message
 import requests
+import base64
 import socket
 import os
 import json
@@ -13,6 +14,10 @@ history_messages: list[Message] = []
 RECEIVED_DIR = r"E:\go\message_in_go\received_media"
 os.makedirs(RECEIVED_DIR, exist_ok=True)
 
+
+
+
+
 # 🔍 Scan local IP range for devices with TCP port 9000 open
 @app.get("/scan")
 def scan_devices():
@@ -22,29 +27,17 @@ def scan_devices():
     except Exception as e:
         return {"error": str(e)}
 
+
+
+
+
+
+
 # 📤 Send message to a known device (proxy to Go server)
 @app.post("/send")
 def send_message(msg: Message):
     try:
-        # Convert payload to dict for processing
-        payload_dict = msg.dict()
-        
-        # If it's a media message, ensure data is in list format for JSON serialization
-        if msg.message_type in ("image", "video") and isinstance(msg.payload, list):
-            for file_payload in payload_dict["payload"]:
-                if "data" in file_payload:
-                    if isinstance(file_payload["data"], bytes):
-                        # Convert bytes to list for JSON serialization
-                        file_payload["data"] = list(file_payload["data"])
-                    elif isinstance(file_payload["data"], str):
-                        # Convert string to list of bytes
-                        file_payload["data"] = list(file_payload["data"].encode('utf-8'))
-                    elif not isinstance(file_payload["data"], list):
-                        # Convert other types to list
-                        file_payload["data"] = list(bytes(file_payload["data"]))
-        
-        print(f"[DEBUG] Sending payload to Go server: {type(payload_dict['payload'][0]['data'])}")
-        response = requests.post("http://localhost:8080/send", json=payload_dict)
+        response = requests.post("http://localhost:8080/send", json=msg.dict())
         try:
             return response.json()
         except ValueError:
@@ -54,6 +47,12 @@ def send_message(msg: Message):
             }
     except Exception as e:
         return {"error": str(e)}
+
+
+
+
+
+
 
 @app.post("/receive")
 async def receive_message(msg: Message):
@@ -70,24 +69,18 @@ async def receive_message(msg: Message):
         # Optionally, save the message to a text file
         with open(os.path.join(RECEIVED_DIR, "last_message.txt"), "w") as f:
             f.write(msg.message)
+            
+            
+     
+     
+            
+            
 
     # Save media files if image or video
     if msg.message_type in ("image", "video"):
         for file in msg.payload:
             try:
-                # Handle raw bytes directly
-                if isinstance(file["data"], bytes):
-                    file_bytes = file["data"]
-                elif isinstance(file["data"], list):
-                    # Convert list to bytes (from JSON)
-                    file_bytes = bytes(file["data"])
-                elif isinstance(file["data"], str):
-                    # Convert string to bytes (for text data)
-                    file_bytes = file["data"].encode('utf-8')
-                else:
-                    # Convert other types to bytes
-                    file_bytes = bytes(file["data"])
-                
+                file_bytes = base64.b64decode(file["data"])  # ✅ dictionary access
                 file_path = os.path.join(RECEIVED_DIR, file["name"])
                 with open(file_path, "wb") as out_file:
                     out_file.write(file_bytes)
@@ -98,6 +91,11 @@ async def receive_message(msg: Message):
     # Append to in-memory history
     history_messages.append(msg)
     return {"status": "received"}
+
+
+
+
+
 
 @app.get("/history")
 def history():
