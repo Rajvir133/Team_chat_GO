@@ -1,10 +1,8 @@
 package main
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log"
 	"net"
 	"net/http"
@@ -14,9 +12,6 @@ import (
 	"go_files/transfer"
 )
 
-// ======================
-// /send endpoint
-// ======================
 func SendHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
@@ -36,8 +31,15 @@ func SendHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("Message sent successfully"))
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"success": true,
+		"data": map[string]interface{}{
+			"sender":       msg.Sender,
+			"receiver":     msg.Receiver,
+		},
+	})
 }
 
 // ======================
@@ -58,31 +60,4 @@ func ScanHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"devices": devices,
 	})
-}
-
-// ======================
-// /receive endpoint
-// ======================
-func ReceiveHandler(w http.ResponseWriter, r *http.Request) {
-	var msg config.Message
-	if err := json.NewDecoder(r.Body).Decode(&msg); err != nil {
-		http.Error(w, fmt.Sprintf("Invalid message: %v", err), http.StatusBadRequest)
-		return
-	}
-
-	log.Printf("[HTTP] Forwarding message from %s to FastAPI...\n", msg.Sender)
-
-	fastapiURL := fmt.Sprintf("http://%s:%d/receive", config.FastAPIHost, config.FastAPIPort)
-	body, _ := json.Marshal(msg)
-
-	resp, err := http.Post(fastapiURL, "application/json", bytes.NewReader(body))
-	if err != nil {
-		http.Error(w, fmt.Sprintf("Failed to forward to FastAPI: %v", err), http.StatusInternalServerError)
-		return
-	}
-	defer resp.Body.Close()
-
-	respBody, _ := io.ReadAll(resp.Body)
-	w.WriteHeader(resp.StatusCode)
-	w.Write(respBody)
 }

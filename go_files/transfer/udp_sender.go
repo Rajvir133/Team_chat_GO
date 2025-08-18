@@ -42,12 +42,12 @@ func SendFileChunksUDP(connTCP net.Conn, receiverIP string, udpPort int, fileHas
 			if err != nil {
 				return fmt.Errorf("failed to send UDP chunk %d: %v", i, err)
 			}
-			fmt.Printf("[UDP] send chunk %d\n", i)
+			// fmt.Printf("[UDP] send chunk %d\n", i)
 
 			connTCP.SetReadDeadline(time.Now().Add(10 * time.Second))
 			ack, err := reader.ReadString('\n')
 			if err == nil && ack == fmt.Sprintf("chunk%d\n", i) {
-				fmt.Printf("[UDP] ack of chunk %d received\n", i)
+				// fmt.Printf("[UDP] ack of chunk %d received\n", i)
 				ackReceived = true
 				break
 			}

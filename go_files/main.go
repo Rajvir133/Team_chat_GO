@@ -16,7 +16,6 @@ func main() {
     // HTTP routes
     http.HandleFunc("/send", SendHandler)
     http.HandleFunc("/scan", ScanHandler)
-    http.HandleFunc("/receive", ReceiveHandler)
 
     log.Printf("🌐 HTTP server running on :%d\n", config.HTTPPort)
     err := http.ListenAndServe(fmt.Sprintf(":%d", config.HTTPPort), nil)

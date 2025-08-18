@@ -9,7 +9,6 @@ import (
 const (
 	HTTPPort     = 8080
 	TCPPort      = 9000
-	UDPPort      = 9002
 	ChunkSize    = 32768
 	AckTimeoutMs = 10000
 	MaxRetries   = 1

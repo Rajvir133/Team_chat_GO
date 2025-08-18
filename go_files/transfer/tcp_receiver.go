@@ -5,11 +5,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
-	"os"
-	"path/filepath"
 	"time"
-
 	"go_files/config"
+    "net/http" 	
+	"bytes" 
 )
 
 func StartTCPServer(port int) {
@@ -51,20 +50,24 @@ func handleTCPConnection(conn net.Conn) {
 	udpPort := allocateUDPPort()
 	fmt.Printf("[TCP] start : %d\n", udpPort)
 	conn.Write([]byte(fmt.Sprintf("Start:%d\n", udpPort)))
-
-	saveDir := "received_media"
-	os.MkdirAll(saveDir, 0755)
-	filePath := filepath.Join(saveDir, metadata.Name)
-
+	
+	fileDataChan := make(chan []byte)
 	done := make(chan bool)
-	go StartUDPReceiver(udpPort, metadata, filePath, conn, done)
+
+    go func() {
+        fileBytes := StartUDPReceiver(udpPort, metadata, conn, done)
+        fileDataChan <- fileBytes
+    }()
 
 	select {
 	case <-done:
+		combinedFileData := <-fileDataChan
+
 		fmt.Println("[logs] all chunk received")
 		fmt.Println("[logs] verified")
 		conn.Write([]byte("stop\n"))
 		fmt.Println("[logs] sending stop")
+		go notifyFastAPI(metadata, combinedFileData)
 	case <-time.After(120 * time.Second):
 		fmt.Println("[logs] Timeout waiting for file")
 	}
@@ -74,4 +77,46 @@ func allocateUDPPort() int {
 	l, _ := net.ListenPacket("udp", ":0")
 	defer l.Close()
 	return l.LocalAddr().(*net.UDPAddr).Port
+}
+
+
+
+
+
+
+func notifyFastAPI(metadata config.FileMetadata, combinedFileData []byte) error {
+
+    base64Data := config.EncodeBase64(combinedFileData)
+
+    msg := config.Message{
+        Sender:      metadata.Sender,
+        Receiver:    metadata.Receiver,
+        MessageType: metadata.Type,
+        Message:   "",
+        Payload: []config.FilePayload{
+            {
+                Name: metadata.Name,
+                Type: metadata.Type,
+                Data: base64Data,
+            },
+        },
+    }
+
+    body, err := json.Marshal(msg)
+    if err != nil {
+        return fmt.Errorf("json marshal error: %w", err)
+    }
+
+    url := fmt.Sprintf("http://%s:%d/receive", config.FastAPIHost, config.FastAPIPort)
+    resp, err := http.Post(url, "application/json", bytes.NewReader(body))
+    if err != nil {
+        return fmt.Errorf("HTTP post error: %w", err)
+    }
+    resp.Body.Close()
+
+    if resp.StatusCode != http.StatusOK {
+        return fmt.Errorf("FastAPI returned status %d", resp.StatusCode)
+    }
+    fmt.Printf("[✓] Notified FastAPI about %s (%d bytes)\n", metadata.Name, len(combinedFileData))
+    return nil
 }
