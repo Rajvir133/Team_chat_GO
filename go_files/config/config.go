@@ -12,9 +12,9 @@ const (
 	ChunkSize    = 32768
 	AckTimeoutMs = 10000
 	MaxRetries   = 1
-	IPBase       = "192.168.29." // Change as per your network
-	FastAPIHost  = "127.0.0.1"   // Change as needed
-	FastAPIPort  = 8000          // Change as needed
+	IPBase       = "192.168.29."
+	FastAPIHost  = "127.0.0.1"
+	FastAPIPort  = 5000
 )
 
 // ======== File type handling ========
@@ -55,6 +55,7 @@ type FileMetadata struct {
 	Hash     string `json:"hash"`
 	Sender   string `json:"sender"`
 	Receiver string `json:"receiver"`
+	Message  string `json:"Message"`
 }
 
 // ======== Base64 helpers ========

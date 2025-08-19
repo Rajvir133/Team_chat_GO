@@ -50,6 +50,7 @@ func SendFileTCP(msg config.Message) error {
 		Hash:     hashHex,
 		Sender:   msg.Sender,
 		Receiver: msg.Receiver,
+		Message: msg.Message,
 	}
 
 	metaBytes, _ := json.Marshal(metadata)

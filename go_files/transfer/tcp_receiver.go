@@ -46,6 +46,8 @@ func handleTCPConnection(conn net.Conn) {
 
 	fmt.Printf("Incoming file : %s , %d , %d,%s\n",
 		metadata.Name, metadata.Size, metadata.Chunks, metadata.Sender)
+	
+	fmt.Printf("Text_message : %s\n",metadata.Message)
 
 	udpPort := allocateUDPPort()
 	fmt.Printf("[TCP] start : %d\n", udpPort)
@@ -81,40 +83,41 @@ func allocateUDPPort() int {
 
 
 
-
-
-
 func notifyFastAPI(metadata config.FileMetadata, combinedFileData []byte) error {
-
-    base64Data := config.EncodeBase64(combinedFileData)
+	fmt.Printf("inside notify, \n")
+    // base64Data := config.EncodeBase64(combinedFileData)
 
     msg := config.Message{
         Sender:      metadata.Sender,
         Receiver:    metadata.Receiver,
         MessageType: metadata.Type,
-        Message:   "",
-        Payload: []config.FilePayload{
-            {
-                Name: metadata.Name,
-                Type: metadata.Type,
-                Data: base64Data,
-            },
-        },
-    }
+        Message:   metadata.Message,
+    	Payload: []config.FilePayload{      
+        {                                 
+            Name: metadata.Name,
+            Type: metadata.Type,
+            Data: "HELLO",               
+        },                                
+    },
+}
 
     body, err := json.Marshal(msg)
+	fmt.Printf("message %s\n",body)
     if err != nil {
+		fmt.Printf("JSON marshal error: %v\n", err)
         return fmt.Errorf("json marshal error: %w", err)
     }
 
     url := fmt.Sprintf("http://%s:%d/receive", config.FastAPIHost, config.FastAPIPort)
     resp, err := http.Post(url, "application/json", bytes.NewReader(body))
     if err != nil {
+		fmt.Printf("HTTP post error: %v\n", err)
         return fmt.Errorf("HTTP post error: %w", err)
     }
     resp.Body.Close()
 
     if resp.StatusCode != http.StatusOK {
+		fmt.Printf("FastAPI returned status %d\n", resp.StatusCode)
         return fmt.Errorf("FastAPI returned status %d", resp.StatusCode)
     }
     fmt.Printf("[✓] Notified FastAPI about %s (%d bytes)\n", metadata.Name, len(combinedFileData))

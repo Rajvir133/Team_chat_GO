@@ -106,52 +106,45 @@ def send_message(msg: Message):
 
 @app.post("/receive")
 async def receive_message(msg: Message):
-    print(f"[RECEIVED] {msg.message_type.upper()} message from {msg.sender} to {msg.receiver}")
+    print(f"[RECEIVED] {msg.message_type} from {msg.sender} → {msg.receiver}\n")
 
-    # Create message entry for JSON storage
-    message_entry = {
+    entry = {
         "sender": msg.sender,
         "receiver": msg.receiver,
         "message_type": msg.message_type,
-        "txt_message": msg.message or "",
-        "timestamp": datetime.now().isoformat(),
-        "files": []
+        "txt_message": msg.message,
+        "timestamp": datetime.utcnow().isoformat(),
+        "payload": [] 
     }
 
-    # Handle files (save to disk + use hash from Go server)
-    if msg.message_type in ("image", "video"):
-        for file in msg.payload:
+    # save each file in payload (if any)
+    if msg.message_type.startswith(("image/", "video/")):
+        for f in msg.payload:
             try:
-                # Decode and save file
-                file_bytes = base64.b64decode(file["data"])
-                file_path = os.path.join(RECEIVED_DIR, file["name"])
-                
-                # Save file to disk
-                with open(file_path, "wb") as out_file:
-                    out_file.write(file_bytes)
-                
-                # Use hash provided by Go server (no need to recalculate)
-                file_hash = file.get("hash", "")  # Get hash from Go server
-                
-                # Add file metadata to JSON
-                message_entry["files"].append({
-                    "file_name": file["name"],
-                    "file_type": file.get("type", ""),
-                    "file_size": len(file_bytes),
-                    "file_hash": file_hash
+                # decode base-64
+                raw = base64.b64decode(f.data) if f.data else b""
+                file_path = os.path.join(RECEIVED_DIR, f.name)
+                with open(file_path, "wb") as fh:
+                    fh.write(raw)
+
+                # record metadata
+                entry["payload"].append({
+                    "name":  f.name,
+                    "type":  f.type,
+                    "size":  len(raw),
+                    "hash":  f.hash or "",
+                    "path":  file_path
                 })
-                
-                print(f"[✓] Saved {file['name']} (hash: {file_hash[:16]}...)")
-                
+                print(f"[✓] saved {f.name} ({len(raw)} bytes)")
             except Exception as e:
-                print(f"[!] Failed to save {file.get('name', 'unknown')}: {e}")
+                print(f"[!] failed to save {f.name}: {e}")
+    else:
+        # non-file message (e.g. plain text)
+        entry["payload"] = [p.dict() for p in msg.payload]
 
-    # Add to message history and save to JSON
-    received_messages.append(message_entry)
+    received_messages.append(entry)
     save_messages()
-    
     return {"status": "received"}
-
 
 
 
