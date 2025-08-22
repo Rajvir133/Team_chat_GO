@@ -2,24 +2,33 @@ package transfer
 
 import (
 	"bufio"
-	"bytes"
-	"compress/zlib"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"net"
-
+	"bytes"
+	"compress/zlib"
 	"go_files/config"
 )
 
-func SendFileTCP(msg config.Message) error {
+func Send_TCP(msg config.Message) error {
 	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", msg.Receiver, config.TCPPort))
 	if err != nil {
-		return fmt.Errorf("TCP connect error: %v", err)
+		return fmt.Errorf("[logs] TCP connect error: %v", err)
 	}
 	defer conn.Close()
 
-	fmt.Printf("send request from %s to %s\n", msg.Sender, msg.Receiver)
+	if msg.MessageType == "text" {
+		if err := json.NewEncoder(conn).Encode(msg); err != nil {
+			return fmt.Errorf("failed to send text message: %v", err)
+		}
+		fmt.Println("[logs] text message sent successfully")
+		return nil
+	}
+
+	if len(msg.Payload) == 0 {
+		return fmt.Errorf("[logs] file transfer requested but payload is empty")
+	}
 
 	reader := bufio.NewReader(conn)
 	writer := bufio.NewWriter(conn)
@@ -50,7 +59,7 @@ func SendFileTCP(msg config.Message) error {
 		Hash:     hashHex,
 		Sender:   msg.Sender,
 		Receiver: msg.Receiver,
-		Message: msg.Message,
+		Message:  msg.Message,
 	}
 
 	metaBytes, _ := json.Marshal(metadata)
@@ -59,22 +68,21 @@ func SendFileTCP(msg config.Message) error {
 
 	startLine, _ := reader.ReadString('\n')
 	if len(startLine) == 0 {
-		return fmt.Errorf("no Start signal from receiver")
+		return fmt.Errorf("[logs] no Start signal from receiver")
 	}
 	var udpPort int
 	fmt.Sscanf(startLine, "Start:%d\n", &udpPort)
-	fmt.Printf("[TCP]received start : %d\n", udpPort)
+	fmt.Printf("[TCP] received start : %d\n", udpPort)
 
-	err = SendFileChunksUDP(conn, msg.Receiver, udpPort, hash, compressedData, chunks)
+	err = SendFileChunksUDP(conn,msg.Sender, msg.Receiver, udpPort, hash, compressedData, chunks)
 	if err != nil {
 		return err
 	}
 
 	stopLine, _ := reader.ReadString('\n')
 	if stopLine == "stop\n" {
-		fmt.Println("[TCP]received : stop")
-		fmt.Println("[log]sent successfully")
+		fmt.Println("[TCP] received : stop")
+		fmt.Println("[log] sent successfully")
 	}
-
 	return nil
 }

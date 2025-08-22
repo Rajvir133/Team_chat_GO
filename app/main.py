@@ -14,18 +14,12 @@ app = FastAPI()
 connected_devices = []
 
 
-
-
-RECEIVED_DIR = r"E:\go\message_in_go\received_media"
+RECEIVED_DIR = r"received_media"
 MESSAGES_FILE = os.path.join(RECEIVED_DIR, "messages_history.json")
 os.makedirs(RECEIVED_DIR, exist_ok=True)
 
 # Use your exact structure
 received_messages: List[dict] = []
-
-
-
-
 
 
 def load_messages():
@@ -54,13 +48,6 @@ def save_messages():
 load_messages()
 
 
-
-
-
-
-
-
-
 # 🔍 Scan local IP range for devices with TCP port 9000 open
 @app.get("/scan")
 def scan_devices():
@@ -69,14 +56,6 @@ def scan_devices():
         return response.json()
     except Exception as e:
         return {"error": str(e)}
-
-
-
-
-
-
-
-
 
 
 # 📤 Send message to a known device (proxy to Go server)
@@ -95,18 +74,9 @@ def send_message(msg: Message):
         return {"error": str(e)}
 
 
-
-
-
-
-
-
-
-
-
 @app.post("/receive")
 async def receive_message(msg: Message):
-    print(f"[RECEIVED] {msg.message_type} from {msg.sender} → {msg.receiver}\n")
+    print(f"[RECEIVED] {msg.message_type} from {msg.sender} → {msg.receiver}")
 
     entry = {
         "sender": msg.sender,
@@ -114,38 +84,63 @@ async def receive_message(msg: Message):
         "message_type": msg.message_type,
         "txt_message": msg.message,
         "timestamp": datetime.utcnow().isoformat(),
-        "payload": [] 
+        "payload": []
     }
 
-    # save each file in payload (if any)
-    if msg.message_type.startswith(("image/", "video/")):
-        for f in msg.payload:
-            try:
-                # decode base-64
-                raw = base64.b64decode(f.data) if f.data else b""
-                file_path = os.path.join(RECEIVED_DIR, f.name)
-                with open(file_path, "wb") as fh:
-                    fh.write(raw)
+    try:
+        if msg.message_type == "text":
+            print(f"[TEXT] Pure text message received")
 
-                # record metadata
-                entry["payload"].append({
-                    "name":  f.name,
-                    "type":  f.type,
-                    "size":  len(raw),
-                    "hash":  f.hash or "",
-                    "path":  file_path
-                })
-                print(f"[✓] saved {f.name} ({len(raw)} bytes)")
-            except Exception as e:
-                print(f"[!] failed to save {f.name}: {e}")
-    else:
-        # non-file message (e.g. plain text)
-        entry["payload"] = [p.dict() for p in msg.payload]
+            if msg.payload:
+                entry["payload"] = []
+            
+        # Handle file messages (images, videos, documents)  
+        elif msg.message_type.startswith(("image/", "video/")):
+            print(f"[FILE] Processing file message")
+            if msg.payload:
+                for f in msg.payload:
+                    try:
+                        # Decode base64 data
+                        raw = base64.b64decode(f.data) if f.data else b""
+                        file_path = os.path.join(RECEIVED_DIR, f.name)
+                        
+                        with open(file_path, "wb") as fh:
+                            fh.write(raw)
 
+                        entry["payload"].append({
+                            "name": f.name,
+                            "type": f.type,
+                            "size": len(raw),
+                        })                        
+                        print(f"[✓] Saved {f.name} ({len(raw)} bytes)")
+                        
+                    except Exception as e:
+                        print(f"[!] Failed to save {f.name}: {e}")
+                        entry["payload"].append({
+                            "name": f.name if hasattr(f, 'name') else 'unknown',
+                            "type": f.type if hasattr(f, 'type') else 'unknown', 
+                            "size": 0,
+                            "error": str(e)
+                        })
+        
+        # Handle unknown message types gracefully
+        else:
+            print(f"[WARN] Unknown message type: {msg.message_type}")
+            entry["payload"] = []
+
+    except Exception as e:
+        print(f"[ERROR] Failed to process message: {e}")
+        entry["error"] = str(e)
+
+    # Always save the message
     received_messages.append(entry)
     save_messages()
-    return {"status": "received"}
-
+    
+    return {
+        "status": "received",
+        "message_type": msg.message_type,
+        "payload_count": len(entry.get("payload", []))
+    }
 
 
 @app.get("/messages")

@@ -24,12 +24,16 @@ func SendHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Printf("[HTTP] /send request from %s to %s (%s)\n", msg.Sender, msg.Receiver, msg.MessageType)
+	log.Printf("[logs] send request from %s to %s (%s)\n", msg.Sender, msg.Receiver, msg.MessageType)
 
-	if err := transfer.SendFileTCP(msg); err != nil {
+	start := time.Now()
+
+	if err := transfer.Send_TCP(msg); err != nil {
 		http.Error(w, fmt.Sprintf("Send failed: %v", err), http.StatusInternalServerError)
 		return
 	}
+
+	elapsed := time.Since(start)
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
@@ -38,9 +42,13 @@ func SendHandler(w http.ResponseWriter, r *http.Request) {
 		"data": map[string]interface{}{
 			"sender":       msg.Sender,
 			"receiver":     msg.Receiver,
+			"time_taken_ms": elapsed.Milliseconds(),
+			"time_taken_s":    elapsed.Seconds(),
 		},
 	})
 }
+
+
 
 // ======================
 // /scan endpoint

@@ -15,7 +15,6 @@ func StartUDPReceiver(port int, metadata config.FileMetadata, conn net.Conn, don
     udpConn, _ := net.ListenUDP("udp", udpAddr)
     defer udpConn.Close()
 
-    // 🆕 ONLY store in memory during transfer
     fileBytes := make([]byte, metadata.Size)
     received := make(map[int]bool)
 

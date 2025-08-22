@@ -38,17 +38,39 @@ func handleTCPConnection(conn net.Conn) {
 		return
 	}
 
+
+	var Message config.Message
+	if err := json.Unmarshal([]byte(metaLine), &Message); err == nil {
+		fmt.Printf("message_type : %s\n", Message.MessageType)
+
+
+	if Message.MessageType == "text"{
+
+		metadata := config.FileMetadata{
+            Sender:   Message.Sender,
+            Receiver: Message.Receiver,
+            Type:     Message.MessageType,
+            Message:  Message.Message,
+            Name:     "",
+            Size:     0,
+            Chunks:   0,
+            Hash:     "",
+		}
+
+		go notifyFastAPI(metadata, []byte{})
+		fmt.Println("[logs] Text message sent to FastAPI")
+		return
+	}
+
 	var metadata config.FileMetadata
 	if err := json.Unmarshal([]byte(metaLine), &metadata); err != nil {
 		fmt.Println("[!] Invalid metadata:", err)
 		return
 	}
 
-	fmt.Printf("Incoming file : %s , %d , %d,%s\n",
-		metadata.Name, metadata.Size, metadata.Chunks, metadata.Sender)
+	fmt.Printf("[logs] Incoming file : %s , %d , %d,%s , %s\n",
+		metadata.Name, metadata.Size, metadata.Chunks, metadata.Sender,metadata.Type)
 	
-	fmt.Printf("Text_message : %s\n",metadata.Message)
-
 	udpPort := allocateUDPPort()
 	fmt.Printf("[TCP] start : %d\n", udpPort)
 	conn.Write([]byte(fmt.Sprintf("Start:%d\n", udpPort)))
@@ -66,14 +88,25 @@ func handleTCPConnection(conn net.Conn) {
 		combinedFileData := <-fileDataChan
 
 		fmt.Println("[logs] all chunk received")
-		fmt.Println("[logs] verified")
 		conn.Write([]byte("stop\n"))
-		fmt.Println("[logs] sending stop")
+		fmt.Println("[TCP] sending stop")
 		go notifyFastAPI(metadata, combinedFileData)
 	case <-time.After(120 * time.Second):
 		fmt.Println("[logs] Timeout waiting for file")
 	}
+  }
 }
+
+
+
+
+
+
+
+
+
+
+
 
 func allocateUDPPort() int {
 	l, _ := net.ListenPacket("udp", ":0")
@@ -84,8 +117,7 @@ func allocateUDPPort() int {
 
 
 func notifyFastAPI(metadata config.FileMetadata, combinedFileData []byte) error {
-	fmt.Printf("inside notify, \n")
-    // base64Data := config.EncodeBase64(combinedFileData)
+    base64Data := config.EncodeBase64(combinedFileData)
 
     msg := config.Message{
         Sender:      metadata.Sender,
@@ -96,13 +128,12 @@ func notifyFastAPI(metadata config.FileMetadata, combinedFileData []byte) error 
         {                                 
             Name: metadata.Name,
             Type: metadata.Type,
-            Data: "HELLO",               
+            Data: base64Data,               
         },                                
     },
 }
 
     body, err := json.Marshal(msg)
-	fmt.Printf("message %s\n",body)
     if err != nil {
 		fmt.Printf("JSON marshal error: %v\n", err)
         return fmt.Errorf("json marshal error: %w", err)

@@ -11,8 +11,9 @@ import (
 	"go_files/config"
 )
 
-func SendFileChunksUDP(connTCP net.Conn, receiverIP string, udpPort int, fileHash [32]byte, data []byte, totalChunks int) error {
+func SendFileChunksUDP(connTCP net.Conn,sender string, receiverIP string, udpPort int, fileHash [32]byte, data []byte, totalChunks int) error {
 	udpAddr, _ := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", receiverIP, udpPort))
+	
 	udpConn, _ := net.DialUDP("udp", nil, udpAddr)
 	defer udpConn.Close()
 
@@ -36,18 +37,18 @@ func SendFileChunksUDP(connTCP net.Conn, receiverIP string, udpPort int, fileHas
 
 		// Send-with-ACK loop: do not proceed to next chunk until proper ACK
 		ackReceived := false
-		maxRetries := 1
+		maxRetries := config.MaxRetries
 		for attempt := 0; attempt <= maxRetries; attempt++ {
 			_, err := udpConn.Write(packet)
 			if err != nil {
-				return fmt.Errorf("failed to send UDP chunk %d: %v", i, err)
+				return fmt.Errorf("[logs] failed to send UDP chunk %d: %v", i, err)
 			}
-			// fmt.Printf("[UDP] send chunk %d\n", i)
+			fmt.Printf("[UDP] send chunk %d to %s\n", i,sender)
 
 			connTCP.SetReadDeadline(time.Now().Add(10 * time.Second))
 			ack, err := reader.ReadString('\n')
 			if err == nil && ack == fmt.Sprintf("chunk%d\n", i) {
-				// fmt.Printf("[UDP] ack of chunk %d received\n", i)
+				fmt.Printf("[UDP] ack of chunk %d received from %s \n", i,sender)
 				ackReceived = true
 				break
 			}
@@ -59,7 +60,7 @@ func SendFileChunksUDP(connTCP net.Conn, receiverIP string, udpPort int, fileHas
 			// retry will re-send the same chunk
 		}
 		if !ackReceived {
-			return fmt.Errorf("[log]no ACK for chunk %d after retries", i)
+			return fmt.Errorf("[logs] no ACK for chunk %d after retries from %s", i,sender)
 		}
 	}
 	return nil

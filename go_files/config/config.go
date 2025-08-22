@@ -55,7 +55,7 @@ type FileMetadata struct {
 	Hash     string `json:"hash"`
 	Sender   string `json:"sender"`
 	Receiver string `json:"receiver"`
-	Message  string `json:"Message"`
+	Message  string `json:"message"`
 }
 
 // ======== Base64 helpers ========
@@ -69,6 +69,7 @@ func EncodeBase64(data []byte) string {
 
 // EncodeBase64FromFile reads a file and encodes it to base64
 func EncodeBase64FromFile(filePath string) string {
+	
 	data, err := os.ReadFile(filePath)
 	if err != nil {
 		return ""

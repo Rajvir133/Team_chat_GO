@@ -10,7 +10,7 @@ import (
 )
 
 func main() {
-    // Start TCP server in background
+    
     go transfer.StartTCPServer(config.TCPPort)
 
     // HTTP routes
