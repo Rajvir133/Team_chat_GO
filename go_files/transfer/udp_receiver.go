@@ -41,7 +41,7 @@ func StartUDPReceiver(port int, metadata config.FileMetadata, conn net.Conn, don
             offset := (idx - 1) * config.ChunkSize
             copy(fileBytes[offset:], data[:size])
             received[idx] = true
-            // fmt.Printf("[UDP] chunk %d received\n", idx)
+            // fmt.Printf("[UDP] chunk %d received from %s\n", idx,metadata.Sender)
         }
 
         // Always ACK the received index so sender can progress

@@ -16,7 +16,7 @@ func StartTCPServer(port int) {
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("[ TCP ] server listening on port %d...\n", port)
+	fmt.Printf("[TCP] server listening on port %d...\n", port)
 
 	for {
 		conn, err := listener.Accept()
@@ -27,6 +27,9 @@ func StartTCPServer(port int) {
 		go handleTCPConnection(conn)
 	}
 }
+
+
+
 
 func handleTCPConnection(conn net.Conn) {
 	defer conn.Close()
@@ -97,24 +100,11 @@ func handleTCPConnection(conn net.Conn) {
   }
 }
 
-
-
-
-
-
-
-
-
-
-
-
 func allocateUDPPort() int {
 	l, _ := net.ListenPacket("udp", ":0")
 	defer l.Close()
 	return l.LocalAddr().(*net.UDPAddr).Port
 }
-
-
 
 func notifyFastAPI(metadata config.FileMetadata, combinedFileData []byte) error {
     base64Data := config.EncodeBase64(combinedFileData)
@@ -131,15 +121,15 @@ func notifyFastAPI(metadata config.FileMetadata, combinedFileData []byte) error 
             Data: base64Data,               
         },                                
     },
-}
-
+	}
+	
     body, err := json.Marshal(msg)
     if err != nil {
 		fmt.Printf("JSON marshal error: %v\n", err)
         return fmt.Errorf("json marshal error: %w", err)
     }
 
-    url := fmt.Sprintf("http://%s:%d/receive", config.FastAPIHost, config.FastAPIPort)
+    url := fmt.Sprintf("http://%s:%d/go_message", config.FastAPIHost, config.FastAPIPort)
     resp, err := http.Post(url, "application/json", bytes.NewReader(body))
     if err != nil {
 		fmt.Printf("HTTP post error: %v\n", err)

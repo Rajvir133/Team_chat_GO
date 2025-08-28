@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Query,jsonify
 from app.models import Message
 import requests
 import base64
@@ -21,33 +21,6 @@ os.makedirs(RECEIVED_DIR, exist_ok=True)
 # Use your exact structure
 received_messages: List[dict] = []
 
-
-def load_messages():
-    """Load messages from JSON file on startup"""
-    global received_messages
-    try:
-        if os.path.exists(MESSAGES_FILE):
-            with open(MESSAGES_FILE, "r", encoding="utf-8") as f:
-                received_messages = json.load(f)
-                print(f"[logs] Loaded {len(received_messages)} messages from history")
-        else:
-            print("[logs] No message history found, starting fresh")
-    except Exception as e:
-        print(f"[ERROR] Failed to load message history: {e}")
-        received_messages = []
-def save_messages():
-    """Save messages to JSON file"""
-    try:
-        with open(MESSAGES_FILE, "w", encoding="utf-8") as f:
-            json.dump(received_messages, f, indent=2, default=str, ensure_ascii=False)
-        print(f"[SAVE] Saved {len(received_messages)} messages to history")
-    except Exception as e:
-        print(f"[ERROR] Failed to save messages: {e}")
-
-# Load messages on startup
-load_messages()
-
-
 # 🔍 Scan local IP range for devices with TCP port 9000 open
 @app.get("/scan")
 def scan_devices():
@@ -64,7 +37,7 @@ def send_message(msg: Message):
     try:
         response = requests.post("http://localhost:8080/send", json=msg.dict())
         try:
-            return response.json()
+            return {"success":True,"data":response}
         except ValueError:
             return {
                 "status": "sent, but non-JSON response from Go",
@@ -74,7 +47,7 @@ def send_message(msg: Message):
         return {"error": str(e)}
 
 
-@app.post("/receive")
+@app.post("/go_message")
 async def receive_message(msg: Message):
     print(f"[RECEIVED] {msg.message_type} from {msg.sender} → {msg.receiver}")
 
@@ -143,7 +116,7 @@ async def receive_message(msg: Message):
     }
 
 
-@app.get("/messages")
+@app.get("/receive/{sender_ip}")
 def get_messages(
     receiver: Optional[str] = None
 ):
@@ -158,3 +131,13 @@ def get_messages(
         
     except Exception as e:
         return {"error": str(e)}
+
+
+def save_messages():
+    """Save messages to JSON file"""
+    try:
+        with open(MESSAGES_FILE, "w", encoding="utf-8") as f:
+            json.dump(received_messages, f, indent=2, default=str, ensure_ascii=False)
+        print(f"[SAVE] Saved {len(received_messages)} messages to history")
+    except Exception as e:
+        print(f"[ERROR] Failed to save messages: {e}")
