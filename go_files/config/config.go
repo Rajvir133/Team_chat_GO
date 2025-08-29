@@ -8,7 +8,7 @@ import (
 // ======== Configuration constants ========
 const (
 	HTTPPort     = 8080
-	TCPPort      = 9000
+	TCPPort      = 9200
 	ChunkSize    = 32768
 	AckTimeoutMs = 10000
 	MaxRetries   = 1

@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Query,jsonify
+from fastapi import FastAPI, Query
 from app.models import Message
 import requests
 import base64
@@ -37,15 +37,15 @@ def send_message(msg: Message):
     try:
         response = requests.post("http://localhost:8080/send", json=msg.dict())
         try:
-            return {"success":True,"data":response}
+            return {"success": True, "data": response.json()}
         except ValueError:
             return {
+                "success": True,
                 "status": "sent, but non-JSON response from Go",
                 "raw_response": response.text
             }
     except Exception as e:
         return {"error": str(e)}
-
 
 @app.post("/go_message")
 async def receive_message(msg: Message):
