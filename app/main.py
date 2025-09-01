@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, Form, File, UploadFile
 from app.models import Message
 import requests
 import base64
@@ -7,8 +7,9 @@ import os
 import json
 import threading
 import hashlib
-from typing import List, Optional
+from typing import List, Optional,Union
 from datetime import datetime
+from uuid import uuid4
 
 app = FastAPI()
 connected_devices = []
@@ -48,87 +49,65 @@ def send_message(msg: Message):
         return {"error": str(e)}
 
 @app.post("/go_message")
-async def receive_message(msg: Message):
-    print(f"[RECEIVED] {msg.message_type} from {msg.sender} → {msg.receiver}")
-
+async def go_message(
+    sender: str = Form(...),
+    receiver: str = Form(...),
+    message_type: str = Form(...),      # "text" or mime like "image/png"
+    message: Optional[str] = Form(""),
+    files: Union[UploadFile, List[UploadFile], None] = File(None),  # ← accept one or many
+):
     entry = {
-        "sender": msg.sender,
-        "receiver": msg.receiver,
-        "message_type": msg.message_type,
-        "txt_message": msg.message,
-        "timestamp": datetime.utcnow().isoformat(),
-        "payload": []
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "sender": sender,
+        "receiver": receiver,
+        "message_type": message_type,
+        "txt_message": message or "",
+        "payload": [],
     }
 
-    try:
-        if msg.message_type == "text":
-            print(f"[TEXT] Pure text message received")
+    # normalize to list
+    file_list: List[UploadFile] = []
+    if files is None:
+        file_list = []
+    elif isinstance(files, list):
+        file_list = files
+    else:
+        file_list = [files]
 
-            if msg.payload:
-                entry["payload"] = []
-            
-        # Handle file messages (images, videos, documents)  
-        elif msg.message_type.startswith(("image/", "video/")):
-            print(f"[FILE] Processing file message")
-            if msg.payload:
-                for f in msg.payload:
-                    try:
-                        # Decode base64 data
-                        raw = base64.b64decode(f.data) if f.data else b""
-                        file_path = os.path.join(RECEIVED_DIR, f.name)
-                        
-                        with open(file_path, "wb") as fh:
-                            fh.write(raw)
+    if file_list:
+        for f in file_list:
+            base = os.path.basename(f.filename) if f.filename else "file.bin"
+            root, ext = os.path.splitext(base)
+            safe_name = f"{root}_{uuid4().hex[:8]}{ext}"
+            path = os.path.join(RECEIVED_DIR, safe_name)
 
-                        entry["payload"].append({
-                            "name": f.name,
-                            "type": f.type,
-                            "size": len(raw),
-                        })                        
-                        print(f"[✓] Saved {f.name} ({len(raw)} bytes)")
-                        
-                    except Exception as e:
-                        print(f"[!] Failed to save {f.name}: {e}")
-                        entry["payload"].append({
-                            "name": f.name if hasattr(f, 'name') else 'unknown',
-                            "type": f.type if hasattr(f, 'type') else 'unknown', 
-                            "size": 0,
-                            "error": str(e)
-                        })
-        
-        # Handle unknown message types gracefully
-        else:
-            print(f"[WARN] Unknown message type: {msg.message_type}")
-            entry["payload"] = []
+            with open(path, "wb") as out:
+                while True:
+                    chunk = await f.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    out.write(chunk)
 
-    except Exception as e:
-        print(f"[ERROR] Failed to process message: {e}")
-        entry["error"] = str(e)
+            entry["payload"].append({
+                "name": safe_name,
+                "original_name": base,
+                "content_type": f.content_type or "",
+                "size": os.path.getsize(path),
+            })
 
-    # Always save the message
     received_messages.append(entry)
     save_messages()
-    
-    return {
-        "status": "received",
-        "message_type": msg.message_type,
-        "payload_count": len(entry.get("payload", []))
-    }
+    return {"status": "ok", "files_saved": len(entry["payload"])}
 
 
-@app.get("/receive/{sender_ip}")
-def get_messages(
-    receiver: Optional[str] = None
-):
+@app.get("/receive")
+def get_messages(receiver: Optional[str] = None):
     try:
         filtered_messages = received_messages
-        
         if receiver:
             filtered_messages = [m for m in filtered_messages if m["receiver"] == receiver]
         filtered_messages = sorted(filtered_messages, key=lambda x: x["timestamp"], reverse=True)
-        
         return filtered_messages
-        
     except Exception as e:
         return {"error": str(e)}
 
