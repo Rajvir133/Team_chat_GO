@@ -1,15 +1,10 @@
 package config
 
-import (
-	"encoding/base64"
-	"os"
-)
-
 // ======== Configuration constants ========
 const (
 	HTTPPort     = 8080
 	TCPPort      = 9200
-	ChunkSize    = 32768
+	ChunkSize    = 22768      // change this size from 32 kb to 12kb
 	AckTimeoutMs = 10000
 	MaxRetries   = 1
 	IPBase       = "192.168.29."
@@ -43,7 +38,7 @@ type Message struct {
 type FilePayload struct {
 	Name string `json:"name"`
 	Type string `json:"type"`
-	Data string `json:"data"`
+	Data []byte `json:"byte"`
 }
 
 // FileMetadata contains file details before sending
@@ -56,25 +51,6 @@ type FileMetadata struct {
 	Sender   string `json:"sender"`
 	Receiver string `json:"receiver"`
 	Message  string `json:"message"`
-}
-
-// ======== Base64 helpers ========
-func DecodeBase64(data string) ([]byte, error) {
-	return base64.StdEncoding.DecodeString(data)
-}
-
-func EncodeBase64(data []byte) string {
-	return base64.StdEncoding.EncodeToString(data)
-}
-
-// EncodeBase64FromFile reads a file and encodes it to base64
-func EncodeBase64FromFile(filePath string) string {
-	
-	data, err := os.ReadFile(filePath)
-	if err != nil {
-		return ""
-	}
-	return EncodeBase64(data)
 }
 
 // ======== Utility ========

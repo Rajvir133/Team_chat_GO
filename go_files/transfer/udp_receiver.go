@@ -14,24 +14,40 @@ import (
 func StartUDPReceiverConn(udpConn *net.UDPConn, metadata config.FileMetadata, conn net.Conn, done chan struct{}) []byte {
 
 	fileBytes := make([]byte, metadata.Size)
-
 	received := make([]bool, metadata.Chunks+1)
 	receivedCount := 0
 
-	for receivedCount < metadata.Chunks {
+	idleStart := time.Now()
+    maxIdle := time.Duration(config.AckTimeoutMs*2) * time.Millisecond
 
-		buf := make([]byte, 44+config.ChunkSize)
-		_ = udpConn.SetReadDeadline(time.Now().Add(20 * time.Second))
 
-		n, _, err := udpConn.ReadFromUDP(buf)
-		if err != nil {
-			fmt.Println("[!] UDP read error:", err)
-			break
-		}
-		if n < 44 {
-			// malformed
-			continue
-	}
+    for receivedCount < metadata.Chunks {
+        buf := make([]byte, 44+config.ChunkSize)
+        _ = udpConn.SetReadDeadline(time.Now().Add(5 * time.Second))
+
+        n, _, err := udpConn.ReadFromUDP(buf)
+        if err != nil {
+            if ne, ok := err.(net.Error); ok && ne.Timeout() {
+
+                if time.Since(idleStart) < maxIdle {
+                    continue
+                }
+                fmt.Println("[logs] UDP idle timeout; not all chunks received")
+                _, _ = conn.Write([]byte("error:timeout\n"))
+                select { case done <- struct{}{}: default: }
+                return nil
+            }
+            fmt.Println("[!] UDP read error:", err)
+            _, _ = conn.Write([]byte("error:udp_read\n"))
+            select { case done <- struct{}{}: default: }
+            return nil
+        }
+
+        idleStart = time.Now()
+
+        if n < 44 {
+            continue
+        }
 
 		// Header layout:
 		// [0:32]   SHA-256 of the (whole) file (ignored per-chunk; final check below)
@@ -93,6 +109,7 @@ func StartUDPReceiver(port int, metadata config.FileMetadata, conn net.Conn, don
 		return nil
 	}
 	udpConn, err := net.ListenUDP("udp", udpAddr)
+	_ = udpConn.SetReadBuffer(4 << 20)
 	if err != nil {
 		fmt.Println("[!] listen UDP:", err)
 		select { case done <- true: default: }

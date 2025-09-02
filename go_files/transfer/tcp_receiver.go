@@ -14,22 +14,29 @@ import (
 )
 
 func StartTCPServer(port int) {
-	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
-	if err != nil {
-		panic(err)
-	}
-	fmt.Printf("[TCP] server listening on port %d...\n", port)
+    listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+    if err != nil {
+        panic(err)
+    }
+    fmt.Printf("[TCP] server listening on port %d...\n", port)
 
-	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			fmt.Println("[!] TCP accept error:", err)
-			continue
-		}
-		go handleTCPConnection(conn)
-	}
+    for {
+        conn, err := listener.Accept()
+        if err != nil {
+            fmt.Println("[Eror] TCP accept error:", err)
+            continue
+        }
+
+        // 🔐 Keep socket healthy across NATs and reduce ACK latency
+        if tcp, ok := conn.(*net.TCPConn); ok {
+            _ = tcp.SetKeepAlive(true)
+            _ = tcp.SetKeepAlivePeriod(30 * time.Second)
+            _ = tcp.SetNoDelay(true)
+        }
+
+        go handleTCPConnection(conn)
+    }
 }
-
 func handleTCPConnection(conn net.Conn) {
 	defer conn.Close()
 	reader := bufio.NewReader(conn)
@@ -82,6 +89,8 @@ func handleTCPConnection(conn net.Conn) {
 		fmt.Println("[!] listen UDP:", err)
 		return
 	}
+	_ = udpConn.SetReadBuffer(4 << 20)
+	
 	udpPort := udpConn.LocalAddr().(*net.UDPAddr).Port
 
 	fmt.Printf("[TCP] start : %d\n", udpPort)

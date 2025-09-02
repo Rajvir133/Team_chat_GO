@@ -3,8 +3,8 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"log"
 	"net"
+	"io"
 	"net/http"
 	"time"
 
@@ -13,39 +13,23 @@ import (
 )
 
 func SendHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
-		return
-	}
+    if r.Method != http.MethodPost {
+        http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+        return
+    }
 
-	var msg config.Message
-	if err := json.NewDecoder(r.Body).Decode(&msg); err != nil {
-		http.Error(w, fmt.Sprintf("Invalid request body: %v", err), http.StatusBadRequest)
-		return
-	}
+    msg, err := create_payload(r)
+    if err != nil {
+        http.Error(w, fmt.Sprintf("bad request: %v", err), http.StatusBadRequest)
+        return
+    }
 
-	log.Printf("[logs] send request from %s to %s (%s)\n", msg.Sender, msg.Receiver, msg.MessageType)
+    if err := transfer.Send_TCP(msg); err != nil {
+        http.Error(w, fmt.Sprintf("send failed: %v", err), http.StatusBadGateway)
+        return
+    }
 
-	start := time.Now()
-
-	if err := transfer.Send_TCP(msg); err != nil {
-		http.Error(w, fmt.Sprintf("Send failed: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	elapsed := time.Since(start)
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success": true,
-		"data": map[string]interface{}{
-			"sender":       msg.Sender,
-			"receiver":     msg.Receiver,
-			"time_taken_ms": elapsed.Milliseconds(),
-			"time_taken_s":    elapsed.Seconds(),
-		},
-	})
+    _ = json.NewEncoder(w).Encode(map[string]any{"success": true})
 }
 
 
@@ -68,4 +52,49 @@ func ScanHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"devices": devices,
 	})
+}
+
+
+
+
+func create_payload(r *http.Request) (config.Message, error) {
+    if err := r.ParseMultipartForm(128 << 20); err != nil {
+        return config.Message{}, fmt.Errorf("parse multipart: %w", err)
+    }
+
+    msg := config.Message{
+        Sender:      r.FormValue("sender"),
+        Receiver:    r.FormValue("receiver"),
+        MessageType: r.FormValue("message_type"),
+        Message:     r.FormValue("message"),
+    }
+
+    if msg.Sender == "" || msg.Receiver == "" || msg.MessageType == "" {
+        return config.Message{}, fmt.Errorf("required fields missing")
+    }
+
+    if r.MultipartForm != nil {
+        if fhs, ok := r.MultipartForm.File["files"]; ok {
+            for _, fh := range fhs {
+                f, err := fh.Open()
+                if err != nil {
+                    return config.Message{}, fmt.Errorf("open %s: %w", fh.Filename, err)
+                }
+                data, err := io.ReadAll(f)
+                f.Close()
+                if err != nil {
+                    return config.Message{}, fmt.Errorf("read %s: %w", fh.Filename, err)
+                }
+                ct := fh.Header.Get("Content-Type")
+                if ct == "" {
+                    ct = "application/octet-stream"
+                }
+                msg.Payload = append(msg.Payload, config.FilePayload{
+                    Name: fh.Filename, Type: ct, Data: data,
+                })
+            }
+        }
+    }
+
+    return msg, nil
 }

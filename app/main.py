@@ -1,12 +1,8 @@
 from fastapi import FastAPI, Form, File, UploadFile
 from app.models import Message
 import requests
-import base64
-import socket
 import os
 import json
-import threading
-import hashlib
 from typing import List, Optional,Union
 from datetime import datetime
 from uuid import uuid4
@@ -54,7 +50,7 @@ async def go_message(
     receiver: str = Form(...),
     message_type: str = Form(...),      # "text" or mime like "image/png"
     message: Optional[str] = Form(""),
-    files: Union[UploadFile, List[UploadFile], None] = File(None),  # ← accept one or many
+    files: Union[UploadFile, List[UploadFile], None] = File(None),
 ):
     entry = {
         "timestamp": datetime.utcnow().isoformat() + "Z",
