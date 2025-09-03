@@ -90,7 +90,7 @@ func Send_TCP(msg config.Message) error {
 	if _, err := fmt.Sscanf(startLine, "Start:%d\n", &udpPort); err != nil {
 		return fmt.Errorf("[logs] could not parse UDP port from %q: %v", startLine, err)
 	}
-	fmt.Printf("[TCP] received start : %d\n", udpPort)
+	fmt.Printf("[TCP] received start at %d\n", udpPort)
 
 	err = SendFileChunksUDP(conn,msg.Sender, msg.Receiver, udpPort, hash, compressedData, chunks)
 	if err != nil {
@@ -103,7 +103,7 @@ func Send_TCP(msg config.Message) error {
 	}
 	switch stopLine {
 	case "stop\n":
-		fmt.Println("[TCP] received : stop")
+		fmt.Println("[TCP] received stop")
 		fmt.Println("[log] sent successfully")
 	case "error:timeout\n":
 		return fmt.Errorf("receiver timeout waiting for chunks")

@@ -1,9 +1,8 @@
 from fastapi import FastAPI, Form, File, UploadFile
-from app.models import Message
 import requests
 import os
 import json
-from typing import List, Optional,Union
+from typing import List, Optional,Union, Tuple
 from datetime import datetime
 from uuid import uuid4
 
@@ -18,7 +17,12 @@ os.makedirs(RECEIVED_DIR, exist_ok=True)
 # Use your exact structure
 received_messages: List[dict] = []
 
-# 🔍 Scan local IP range for devices with TCP port 9000 open
+
+
+
+
+
+# 🔍 Scan local IP range for devices with TCP port 9200 open
 @app.get("/scan")
 def scan_devices():
     try:
@@ -28,72 +32,81 @@ def scan_devices():
         return {"error": str(e)}
 
 
+
+
+
+
+
+
 # 📤 Send message to a known device (proxy to Go server)
 @app.post("/send")
-def send_message(msg: Message):
-    try:
-        response = requests.post("http://localhost:8080/send", json=msg.dict())
-        try:
-            return {"success": True, "data": response.json()}
-        except ValueError:
-            return {
-                "success": True,
-                "status": "sent, but non-JSON response from Go",
-                "raw_response": response.text
-            }
-    except Exception as e:
-        return {"error": str(e)}
-
-@app.post("/go_message")
-async def go_message(
+def send_message(
     sender: str = Form(...),
     receiver: str = Form(...),
-    message_type: str = Form(...),      # "text" or mime like "image/png"
+    message_type: str = Form(...),
     message: Optional[str] = Form(""),
     files: Union[UploadFile, List[UploadFile], None] = File(None),
 ):
-    entry = {
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-        "sender": sender,
-        "receiver": receiver,
-        "message_type": message_type,
-        "txt_message": message or "",
-        "payload": [],
-    }
+    try:
+        msg, blobs = create_message(sender, receiver, message_type, message, files)
+        
+        
+        if not blobs:
+            files_param = [("files", ("", b"", "application/octet-stream"))]
+            msg["message_type"] = "text"
+        else:
+            files_param = [("files", (name, content, ctype)) for (name, content, ctype) in blobs]
+        
+        resp = requests.post("http://localhost:8080/send", data=msg, files=files_param)
+        try:
+            return resp.json()
+        except ValueError:
+            return {"status": resp.status_code, "body": resp.text}
+    except Exception as e:
+        return {"error": str(e)}
 
-    # normalize to list
-    file_list: List[UploadFile] = []
-    if files is None:
-        file_list = []
-    elif isinstance(files, list):
-        file_list = files
-    else:
-        file_list = [files]
 
-    if file_list:
-        for f in file_list:
-            base = os.path.basename(f.filename) if f.filename else "file.bin"
-            root, ext = os.path.splitext(base)
-            safe_name = f"{root}_{uuid4().hex[:8]}{ext}"
-            path = os.path.join(RECEIVED_DIR, safe_name)
 
+
+
+@app.post("/go_message")
+def go_message(
+    sender: str = Form(...),
+    receiver: str = Form(...),
+    message_type: str = Form(...),
+    message: Optional[str] = Form(""),
+    files: Union[UploadFile, List[UploadFile], None] = File(None),
+):
+    try:
+        msg, blobs = create_message(sender, receiver, message_type, message, files)
+        os.makedirs(RECEIVED_DIR, exist_ok=True)
+        payload = []
+        for name, content, ctype in blobs:
+            base = os.path.basename(name)
+            path = os.path.join(RECEIVED_DIR, base)
             with open(path, "wb") as out:
-                while True:
-                    chunk = await f.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    out.write(chunk)
-
-            entry["payload"].append({
-                "name": safe_name,
-                "original_name": base,
-                "content_type": f.content_type or "",
-                "size": os.path.getsize(path),
+                out.write(content)
+            payload.append({
+                "name": base,
+                "content_type": ctype,
+                "size": len(content),
             })
 
-    received_messages.append(entry)
-    save_messages()
-    return {"status": "ok", "files_saved": len(entry["payload"])}
+        entry = {
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            **msg,
+            "payload": payload,
+        }
+        received_messages.append(entry)
+        save_messages()
+        return {"status": "ok", "files_saved": len(payload)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+
+
+
 
 
 @app.get("/receive")
@@ -108,6 +121,16 @@ def get_messages(receiver: Optional[str] = None):
         return {"error": str(e)}
 
 
+
+
+
+
+
+
+
+
+
+
 def save_messages():
     """Save messages to JSON file"""
     try:
@@ -116,3 +139,40 @@ def save_messages():
         print(f"[SAVE] Saved {len(received_messages)} messages to history")
     except Exception as e:
         print(f"[ERROR] Failed to save messages: {e}")
+        
+           
+def create_message(
+    sender: str,
+    receiver: str,
+    message_type: str,
+    message: Optional[str],
+    files: Union[UploadFile, List[UploadFile], None],
+) -> Tuple[dict, List[Tuple[str, bytes, str]]]:
+    if not sender or not receiver or not message_type:
+        raise ValueError("sender, receiver, and message_type are required")
+
+    msg = {
+        "sender": sender,
+        "receiver": receiver,
+        "message_type": message_type,
+        "message": message or "",
+    }
+
+    # normalize files to a list
+    if files is None:
+        file_list: List[UploadFile] = []
+    elif isinstance(files, list):
+        file_list = files
+    else:
+        file_list = [files]
+
+    blobs: List[Tuple[str, bytes, str]] = []
+    for f in file_list:
+        if f is None:
+            continue
+        content = f.file.read()
+        filename = f.filename or "file.bin"
+        ctype = f.content_type or "application/octet-stream"
+        blobs.append((filename, content, ctype))
+
+    return msg, blobs

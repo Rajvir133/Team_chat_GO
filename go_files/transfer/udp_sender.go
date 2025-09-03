@@ -11,9 +11,9 @@ import (
 	"go_files/config"
 )
 
-func SendFileChunksUDP(connTCP net.Conn,sender string, receiverIP string, udpPort int, fileHash [32]byte, data []byte, totalChunks int) error {
+func SendFileChunksUDP(connTCP net.Conn, senderIP string, receiverIP string, udpPort int, fileHash [32]byte, data []byte, totalChunks int) error {
 	udpAddr, _ := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", receiverIP, udpPort))
-	
+
 	udpConn, _ := net.DialUDP("udp", nil, udpAddr)
 	defer udpConn.Close()
 
@@ -48,7 +48,7 @@ func SendFileChunksUDP(connTCP net.Conn,sender string, receiverIP string, udpPor
 			connTCP.SetReadDeadline(time.Now().Add(time.Duration(config.AckTimeoutMs) * time.Millisecond))
 			ack, err := reader.ReadString('\n')
 			if err == nil && ack == fmt.Sprintf("chunk%d\n", i) {
-				fmt.Printf("[UDP] ack of chunk %d received from %s \n", i,receiverIP)
+				fmt.Printf("[UDP] ack of chunk %d received from %s \n", i, receiverIP)
 				ackReceived = true
 				break
 			}
@@ -57,10 +57,9 @@ func SendFileChunksUDP(connTCP net.Conn,sender string, receiverIP string, udpPor
 			} else {
 				fmt.Printf("[logs] unexpected ack for chunk %d (attempt %d): %q\n", i, attempt+1, ack)
 			}
-			// retry will re-send the same chunk
 		}
 		if !ackReceived {
-			return fmt.Errorf("[logs] no ACK for chunk %d after retries from %s", i,sender)
+			return fmt.Errorf("[logs] no ACK for chunk %d after retries from %s", i, receiverIP)
 		}
 	}
 	return nil

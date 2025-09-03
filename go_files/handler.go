@@ -13,6 +13,7 @@ import (
 )
 
 func SendHandler(w http.ResponseWriter, r *http.Request) {
+    start := time.Now()
     if r.Method != http.MethodPost {
         http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
         return
@@ -29,7 +30,12 @@ func SendHandler(w http.ResponseWriter, r *http.Request) {
         return
     }
 
-    _ = json.NewEncoder(w).Encode(map[string]any{"success": true})
+    elapsed := time.Since(start)
+    _ = json.NewEncoder(w).Encode(map[string]any{
+        "success": true,
+        "time_taken_ms":  elapsed.Milliseconds(),
+        "time_taken_s":   elapsed.Seconds(),
+    })
 }
 
 
@@ -73,28 +79,41 @@ func create_payload(r *http.Request) (config.Message, error) {
         return config.Message{}, fmt.Errorf("required fields missing")
     }
 
-    if r.MultipartForm != nil {
-        if fhs, ok := r.MultipartForm.File["files"]; ok {
-            for _, fh := range fhs {
-                f, err := fh.Open()
-                if err != nil {
-                    return config.Message{}, fmt.Errorf("open %s: %w", fh.Filename, err)
-                }
-                data, err := io.ReadAll(f)
-                f.Close()
-                if err != nil {
-                    return config.Message{}, fmt.Errorf("read %s: %w", fh.Filename, err)
-                }
-                ct := fh.Header.Get("Content-Type")
-                if ct == "" {
-                    ct = "application/octet-stream"
-                }
-                msg.Payload = append(msg.Payload, config.FilePayload{
-                    Name: fh.Filename, Type: ct, Data: data,
-                })
-            }
-        }
-    }
+    msg.Payload = make([]config.FilePayload, 0) 
 
-    return msg, nil
+	if msg.MessageType != "text" && r.MultipartForm != nil {
+		if fhs, ok := r.MultipartForm.File["files"]; ok {
+			for _, fh := range fhs {
+				f, err := fh.Open()
+				if err != nil {
+					return config.Message{}, fmt.Errorf("open %s: %w", fh.Filename, err)
+				}
+				data, err := io.ReadAll(f)
+				_ = f.Close()
+				if err != nil {
+					return config.Message{}, fmt.Errorf("read %s: %w", fh.Filename, err)
+				}
+
+				if len(data) == 0 {
+					continue
+				}
+
+				ct := fh.Header.Get("Content-Type")
+				if ct == "" {
+					ct = "application/octet-stream"
+				}
+
+				msg.Payload = append(msg.Payload, config.FilePayload{
+					Name: fh.Filename, Type: ct, Data: data,
+				})
+			}
+		}
+	}
+
+	// if no usable files, treat it as a text message
+	if len(msg.Payload) == 0 {
+		msg.MessageType = "text"
+	}
+
+	return msg, nil
 }

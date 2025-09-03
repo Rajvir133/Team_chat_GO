@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"mime/multipart"
 	"net"
+	"io"
 	"net/http"
 	"time"
+	"net/textproto"
 
 	"go_files/config"
 )
@@ -23,7 +25,7 @@ func StartTCPServer(port int) {
     for {
         conn, err := listener.Accept()
         if err != nil {
-            fmt.Println("[Eror] TCP accept error:", err)
+            fmt.Println("[Error] TCP accept error:", err)
             continue
         }
 
@@ -37,6 +39,10 @@ func StartTCPServer(port int) {
         go handleTCPConnection(conn)
     }
 }
+
+
+
+
 func handleTCPConnection(conn net.Conn) {
 	defer conn.Close()
 	reader := bufio.NewReader(conn)
@@ -50,19 +56,18 @@ func handleTCPConnection(conn net.Conn) {
 	// Try as "text" path first (config.Message)
 	var msg config.Message
 	if err := json.Unmarshal([]byte(metaLine), &msg); err == nil {
-		fmt.Printf("message_type : %s\n", msg.MessageType)
 		if msg.MessageType == "text" {
 			metadata := config.FileMetadata{
 				Sender:   msg.Sender,
 				Receiver: msg.Receiver,
-				Type:     msg.MessageType, // "text"
+				Type:     msg.MessageType,
 				Message:  msg.Message,
 				Name:     "",
 				Size:     0,
 				Chunks:   0,
 				Hash:     "",
 			}
-			// Notify FastAPI (multipart with only fields, no file)
+
 			go notifyFastAPI(metadata, nil)
 			fmt.Println("[logs] Text message sent to FastAPI")
 			return
@@ -72,7 +77,7 @@ func handleTCPConnection(conn net.Conn) {
 	// Otherwise parse as file metadata
 	var metadata config.FileMetadata
 	if err := json.Unmarshal([]byte(metaLine), &metadata); err != nil {
-		fmt.Println("[!] Invalid metadata:", err)
+		fmt.Println("[Error] Invalid metadata:", err)
 		return
 	}
 
@@ -81,12 +86,12 @@ func handleTCPConnection(conn net.Conn) {
 
 	udpAddr, err := net.ResolveUDPAddr("udp", ":0")
 	if err != nil {
-		fmt.Println("[!] resolve UDP addr:", err)
+		fmt.Println("[Error] resolve UDP addr:", err)
 		return
 	}
 	udpConn, err := net.ListenUDP("udp", udpAddr)
 	if err != nil {
-		fmt.Println("[!] listen UDP:", err)
+		fmt.Println("[Error] listen UDP:", err)
 		return
 	}
 	_ = udpConn.SetReadBuffer(4 << 20)
@@ -95,7 +100,7 @@ func handleTCPConnection(conn net.Conn) {
 
 	fmt.Printf("[TCP] start : %d\n", udpPort)
 	if _, err := conn.Write([]byte(fmt.Sprintf("Start:%d\n", udpPort))); err != nil {
-		fmt.Println("[!] failed to write start:", err)
+		fmt.Println("[Error] failed to write start:", err)
 		udpConn.Close()
 		return
 	}
@@ -148,35 +153,51 @@ func notifyFastAPI(metadata config.FileMetadata, combinedFileData []byte) error 
 
 	// Optional file
 	if len(combinedFileData) > 0 && metadata.Name != "" {
-		fw, err := w.CreateFormFile("files", metadata.Name)
+		hdr := textproto.MIMEHeader{}
+		hdr.Set("Content-Disposition",
+			fmt.Sprintf(`form-data; name="%s"; filename="%s"`, "files", metadata.Name))
+
+		ct := metadata.Type
+		if ct == "" {
+			ct = "application/octet-stream"
+		}
+		hdr.Set("Content-Type", ct)
+
+		fw, err := w.CreatePart(hdr)
 		if err != nil {
-			fmt.Printf("create form file error: %v\n", err)
-			return fmt.Errorf("create form file: %w", err)
+			return fmt.Errorf("create multipart part: %w", err)
 		}
 		if _, err := fw.Write(combinedFileData); err != nil {
-			fmt.Printf("write file bytes error: %v\n", err)
 			return fmt.Errorf("write file bytes: %w", err)
 		}
 	}
 
 	if err := w.Close(); err != nil {
-		fmt.Printf("multipart close error: %v\n", err)
 		return fmt.Errorf("close multipart writer: %w", err)
 	}
 
 	url := fmt.Sprintf("http://%s:%d/go_message", config.FastAPIHost, config.FastAPIPort)
-	resp, err := http.Post(url, w.FormDataContentType(), &body)
+
+	req, err := http.NewRequest("POST", url, &body)
 	if err != nil {
-		fmt.Printf("HTTP post error: %v\n", err)
-		return fmt.Errorf("HTTP post error: %w", err)
+		return fmt.Errorf("new request: %w", err)
+	}
+	req.Header.Set("Content-Type", w.FormDataContentType())
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("http post: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		fmt.Printf("FastAPI returned status %d\n", resp.StatusCode)
-		return fmt.Errorf("FastAPI returned status %d", resp.StatusCode)
+		// include a small snippet of the body to aid debugging
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("FastAPI returned status %d: %s", resp.StatusCode, string(b))
 	}
 
-	fmt.Printf("[✓] Notified FastAPI (multipart) about %s (%d bytes)\n", metadata.Name, len(combinedFileData))
+	fmt.Printf("[✓] Notified FastAPI (multipart) about %s (%d bytes, type %s)\n",
+		metadata.Name, len(combinedFileData), metadata.Type)
 	return nil
 }
