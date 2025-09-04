@@ -3,20 +3,26 @@ package transfer
 import (
 	"bufio"
 	"crypto/sha256"
+	"time"
 	"encoding/json"
 	"fmt"
 	"net"
+	"strings"
 	"bytes"
 	"compress/zlib"
 	"go_files/config"
 )
 
 func Send_TCP(msg config.Message) error {
-	conn, err := net.Dial("tcp", fmt.Sprintf("%s:%d", msg.Receiver, config.TCPPort))
+	d := net.Dialer{KeepAlive: 30 * time.Second, Timeout: 10 * time.Second}
+	conn, err := d.Dial("tcp", fmt.Sprintf("%s:%d", msg.Receiver, config.TCPPort))
 	if err != nil {
 		return fmt.Errorf("[logs] TCP connect error: %v", err)
 	}
 	defer conn.Close()
+	if tcp, ok := conn.(*net.TCPConn); ok {
+		_ = tcp.SetNoDelay(true)
+	}
 
 	if msg.MessageType == "text" {
 		if err := json.NewEncoder(conn).Encode(msg); err != nil {
@@ -34,7 +40,7 @@ func Send_TCP(msg config.Message) error {
 	writer := bufio.NewWriter(conn)
 
 	file := msg.Payload[0]
-	rawBytes, _ := config.DecodeBase64(file.Data)
+	rawBytes := file.Data
 
 	var compressedData []byte
 	if config.NoCompressionTypes[file.Type] {
@@ -62,27 +68,53 @@ func Send_TCP(msg config.Message) error {
 		Message:  msg.Message,
 	}
 
-	metaBytes, _ := json.Marshal(metadata)
-	writer.Write(append(metaBytes, '\n'))
-	writer.Flush()
+	metaBytes, err := json.Marshal(metadata)
+	if err != nil {
+		return fmt.Errorf("marshal metadata: %v", err)
+	}
+	if _, err := writer.Write(append(metaBytes, '\n')); err != nil {
+		return fmt.Errorf("write metadata: %v", err)
+	}
+	if err := writer.Flush(); err != nil {
+		return fmt.Errorf("flush metadata: %v", err)
+}
 
-	startLine, _ := reader.ReadString('\n')
-	if len(startLine) == 0 {
-		return fmt.Errorf("[logs] no Start signal from receiver")
+	startLine, err := reader.ReadString('\n')
+	if err != nil {
+		return fmt.Errorf("[logs] failed to read Start line: %v", err)
+	}
+	if !strings.HasPrefix(startLine, "Start:") {
+		return fmt.Errorf("[logs] invalid Start line: %q", startLine)
 	}
 	var udpPort int
-	fmt.Sscanf(startLine, "Start:%d\n", &udpPort)
-	fmt.Printf("[TCP] received start : %d\n", udpPort)
+	if _, err := fmt.Sscanf(startLine, "Start:%d\n", &udpPort); err != nil {
+		return fmt.Errorf("[logs] could not parse UDP port from %q: %v", startLine, err)
+	}
+	fmt.Printf("[TCP] received start at %d\n", udpPort)
 
 	err = SendFileChunksUDP(conn,msg.Sender, msg.Receiver, udpPort, hash, compressedData, chunks)
 	if err != nil {
 		return err
 	}
 
-	stopLine, _ := reader.ReadString('\n')
-	if stopLine == "stop\n" {
-		fmt.Println("[TCP] received : stop")
+	stopLine, err := reader.ReadString('\n')
+	if err != nil {
+		return fmt.Errorf("read final line: %v", err)
+	}
+	switch stopLine {
+	case "stop\n":
+		fmt.Println("[TCP] received stop")
 		fmt.Println("[log] sent successfully")
+	case "error:timeout\n":
+		return fmt.Errorf("receiver timeout waiting for chunks")
+	case "error:hash_mismatch\n":
+		return fmt.Errorf("receiver hash mismatch")
+	case "error:udp_read\n":
+		return fmt.Errorf("receiver experienced UDP read error")
+	case "error:receive_failed\n":
+		return fmt.Errorf("receiver failed during receive")
+	default:
+		return fmt.Errorf("unexpected final line: %q", stopLine)
 	}
 	return nil
 }

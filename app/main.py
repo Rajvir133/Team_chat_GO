@@ -1,14 +1,10 @@
-from fastapi import FastAPI, Query
-from app.models import Message
+from fastapi import FastAPI, Form, File, UploadFile
 import requests
-import base64
-import socket
 import os
 import json
-import threading
-import hashlib
-from typing import List, Optional
+from typing import List, Optional,Union, Tuple
 from datetime import datetime
+from uuid import uuid4
 
 app = FastAPI()
 connected_devices = []
@@ -21,7 +17,12 @@ os.makedirs(RECEIVED_DIR, exist_ok=True)
 # Use your exact structure
 received_messages: List[dict] = []
 
-# 🔍 Scan local IP range for devices with TCP port 9000 open
+
+
+
+
+
+# 🔍 Scan local IP range for devices with TCP port 9200 open
 @app.get("/scan")
 def scan_devices():
     try:
@@ -31,106 +32,103 @@ def scan_devices():
         return {"error": str(e)}
 
 
+
+
+
+
+
+
 # 📤 Send message to a known device (proxy to Go server)
 @app.post("/send")
-def send_message(msg: Message):
+def send_message(
+    sender: str = Form(...),
+    receiver: str = Form(...),
+    message_type: str = Form(...),
+    message: Optional[str] = Form(""),
+    files: Union[UploadFile, List[UploadFile], None] = File(None),
+):
     try:
-        response = requests.post("http://localhost:8080/send", json=msg.dict())
+        msg, blobs = create_message(sender, receiver, message_type, message, files)
+        
+        
+        if not blobs:
+            files_param = [("files", ("", b"", "application/octet-stream"))]
+            msg["message_type"] = "text"
+        else:
+            files_param = [("files", (name, content, ctype)) for (name, content, ctype) in blobs]
+        
+        resp = requests.post("http://localhost:8080/send", data=msg, files=files_param)
         try:
-            return {"success": True, "data": response.json()}
+            return resp.json()
         except ValueError:
-            return {
-                "success": True,
-                "status": "sent, but non-JSON response from Go",
-                "raw_response": response.text
-            }
+            return {"status": resp.status_code, "body": resp.text}
     except Exception as e:
         return {"error": str(e)}
 
+
+
+
+
 @app.post("/go_message")
-async def receive_message(msg: Message):
-    print(f"[RECEIVED] {msg.message_type} from {msg.sender} → {msg.receiver}")
-
-    entry = {
-        "sender": msg.sender,
-        "receiver": msg.receiver,
-        "message_type": msg.message_type,
-        "txt_message": msg.message,
-        "timestamp": datetime.utcnow().isoformat(),
-        "payload": []
-    }
-
-    try:
-        if msg.message_type == "text":
-            print(f"[TEXT] Pure text message received")
-
-            if msg.payload:
-                entry["payload"] = []
-            
-        # Handle file messages (images, videos, documents)  
-        elif msg.message_type.startswith(("image/", "video/")):
-            print(f"[FILE] Processing file message")
-            if msg.payload:
-                for f in msg.payload:
-                    try:
-                        # Decode base64 data
-                        raw = base64.b64decode(f.data) if f.data else b""
-                        file_path = os.path.join(RECEIVED_DIR, f.name)
-                        
-                        with open(file_path, "wb") as fh:
-                            fh.write(raw)
-
-                        entry["payload"].append({
-                            "name": f.name,
-                            "type": f.type,
-                            "size": len(raw),
-                        })                        
-                        print(f"[✓] Saved {f.name} ({len(raw)} bytes)")
-                        
-                    except Exception as e:
-                        print(f"[!] Failed to save {f.name}: {e}")
-                        entry["payload"].append({
-                            "name": f.name if hasattr(f, 'name') else 'unknown',
-                            "type": f.type if hasattr(f, 'type') else 'unknown', 
-                            "size": 0,
-                            "error": str(e)
-                        })
-        
-        # Handle unknown message types gracefully
-        else:
-            print(f"[WARN] Unknown message type: {msg.message_type}")
-            entry["payload"] = []
-
-    except Exception as e:
-        print(f"[ERROR] Failed to process message: {e}")
-        entry["error"] = str(e)
-
-    # Always save the message
-    received_messages.append(entry)
-    save_messages()
-    
-    return {
-        "status": "received",
-        "message_type": msg.message_type,
-        "payload_count": len(entry.get("payload", []))
-    }
-
-
-@app.get("/receive/{sender_ip}")
-def get_messages(
-    receiver: Optional[str] = None
+def go_message(
+    sender: str = Form(...),
+    receiver: str = Form(...),
+    message_type: str = Form(...),
+    message: Optional[str] = Form(""),
+    files: Union[UploadFile, List[UploadFile], None] = File(None),
 ):
     try:
+        msg, blobs = create_message(sender, receiver, message_type, message, files)
+        os.makedirs(RECEIVED_DIR, exist_ok=True)
+        payload = []
+        for name, content, ctype in blobs:
+            base = os.path.basename(name)
+            path = os.path.join(RECEIVED_DIR, base)
+            with open(path, "wb") as out:
+                out.write(content)
+            payload.append({
+                "name": base,
+                "content_type": ctype,
+                "size": len(content),
+            })
+
+        entry = {
+            "timestamp": datetime.utcnow().isoformat() + "Z",
+            **msg,
+            "payload": payload,
+        }
+        received_messages.append(entry)
+        save_messages()
+        return {"status": "ok", "files_saved": len(payload)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+
+
+
+
+
+@app.get("/receive")
+def get_messages(receiver: Optional[str] = None):
+    try:
         filtered_messages = received_messages
-        
         if receiver:
             filtered_messages = [m for m in filtered_messages if m["receiver"] == receiver]
         filtered_messages = sorted(filtered_messages, key=lambda x: x["timestamp"], reverse=True)
-        
         return filtered_messages
-        
     except Exception as e:
         return {"error": str(e)}
+
+
+
+
+
+
+
+
+
+
 
 
 def save_messages():
@@ -141,3 +139,40 @@ def save_messages():
         print(f"[SAVE] Saved {len(received_messages)} messages to history")
     except Exception as e:
         print(f"[ERROR] Failed to save messages: {e}")
+        
+           
+def create_message(
+    sender: str,
+    receiver: str,
+    message_type: str,
+    message: Optional[str],
+    files: Union[UploadFile, List[UploadFile], None],
+) -> Tuple[dict, List[Tuple[str, bytes, str]]]:
+    if not sender or not receiver or not message_type:
+        raise ValueError("sender, receiver, and message_type are required")
+
+    msg = {
+        "sender": sender,
+        "receiver": receiver,
+        "message_type": message_type,
+        "message": message or "",
+    }
+
+    # normalize files to a list
+    if files is None:
+        file_list: List[UploadFile] = []
+    elif isinstance(files, list):
+        file_list = files
+    else:
+        file_list = [files]
+
+    blobs: List[Tuple[str, bytes, str]] = []
+    for f in file_list:
+        if f is None:
+            continue
+        content = f.file.read()
+        filename = f.filename or "file.bin"
+        ctype = f.content_type or "application/octet-stream"
+        blobs.append((filename, content, ctype))
+
+    return msg, blobs
