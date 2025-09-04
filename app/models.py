@@ -1,17 +1,9 @@
-from typing import List, Optional
 from pydantic import BaseModel
-
-
-class FilePayload(BaseModel):
-    name: str
-    type: str
-    data: Optional[str] = "" 
-    hash: Optional[str] = ""
-
+from typing import List, Dict, Union
 
 class Message(BaseModel):
     sender: str
     receiver: str
     message_type: str
-    message: str = ""          
-    payload: List[FilePayload] 
+    message: str = ""  # New field for text/caption
+    payload: Union[str, List[Dict[str, str]]]
