@@ -34,7 +34,7 @@ type Message struct {
 	Payload     []FilePayload `json:"payload"`
 }
 
-// FilePayload contains file name, type, and base64 data
+// FilePayload contains file name, type, and  data
 type FilePayload struct {
 	Name string `json:"name"`
 	Type string `json:"type"`

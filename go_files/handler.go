@@ -13,50 +13,54 @@ import (
 )
 
 func SendHandler(w http.ResponseWriter, r *http.Request) {
-    start := time.Now()
-    if r.Method != http.MethodPost {
-        http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-        return
-    }
+	if r.Method != http.MethodPost {
+		http.Error(w, `{"success":false,"error":{"code":"METHOD_NOT_ALLOWED","message":"use POST"}}`, http.StatusMethodNotAllowed)
+		return
+	}
 
-    msg, err := create_payload(r)
-    if err != nil {
-        http.Error(w, fmt.Sprintf("bad request: %v", err), http.StatusBadRequest)
-        return
-    }
+	msg, err := create_payload(r)
+	if err != nil {
+		http.Error(w, fmt.Sprintf(`{"success":false,"error":{"code":"BAD_REQUEST","message":%q}}`, err.Error()), http.StatusBadRequest)
+		return
+	}
 
-    if err := transfer.Send_TCP(msg); err != nil {
-        http.Error(w, fmt.Sprintf("send failed: %v", err), http.StatusBadGateway)
-        return
-    }
+	start := time.Now()
+	if err := transfer.Send_TCP(msg); err != nil {
+		http.Error(w, fmt.Sprintf(`{"success":false,"error":{"code":"FORWARDING_FAILED","message":%q}}`, err.Error()), http.StatusBadGateway)
+		return
+	}
+	elapsed := time.Since(start)
 
-    elapsed := time.Since(start)
-    _ = json.NewEncoder(w).Encode(map[string]any{
-        "success": true,
-        "time_taken_ms":  elapsed.Milliseconds(),
-        "time_taken_s":   elapsed.Seconds(),
-    })
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
+		"data": map[string]any{
+			"sender":       msg.Sender,
+			"receiver":     msg.Receiver,
+			"message_type": msg.MessageType,
+			"time_taken_ms": elapsed.Milliseconds(),
+			"time_taken_s":  elapsed.Seconds(),
+		},
+	})
 }
-
 
 
 // ======================
 // /scan endpoint
 // ======================
 func ScanHandler(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
 	devices := []string{}
-
 	for i := 1; i <= 255; i++ {
 		ip := fmt.Sprintf("%s%d", config.IPBase, i)
-		conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", ip, config.TCPPort), 100*time.Millisecond)
-		if err == nil {
+		if conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", ip, config.TCPPort), 100*time.Millisecond); err == nil {
+			_ = conn.Close()
 			devices = append(devices, ip)
-			conn.Close()
 		}
 	}
-
-	json.NewEncoder(w).Encode(map[string]interface{}{
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]any{
 		"devices": devices,
+		"duration_ms": time.Since(start).Milliseconds(),
 	})
 }
 
