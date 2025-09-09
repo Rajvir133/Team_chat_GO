@@ -1,12 +1,13 @@
 package config
 
+
 // ======== Configuration constants ========
 const (
 	HTTPPort     = 8080
 	TCPPort      = 9200
-	ChunkSize    = 22768      // change this size from 32 kb to 12kb
+	ChunkSize    = 22768      // change this size from 32 kb to 22kb
 	AckTimeoutMs = 10000
-	MaxRetries   = 1
+	MaxRetries   = 3
 	IPBase       = "192.168.29."
 	FastAPIHost  = "127.0.0.1"
 	FastAPIPort  = 5000

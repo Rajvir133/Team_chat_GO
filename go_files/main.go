@@ -4,15 +4,17 @@ import (
     "fmt"
     "log"
     "net/http"
+    "sync"
 
     "go_files/config"
     "go_files/transfer"
 )
 
-func main() {
-    
-    go transfer.StartTCPServer(config.TCPPort)
+var connectionPool sync.Map
 
+func main() {
+
+    go transfer.StartTCPServer(config.TCPPort)
     // HTTP routes
     http.HandleFunc("/send", SendHandler)
     http.HandleFunc("/scan", ScanHandler)

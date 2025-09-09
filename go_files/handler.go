@@ -24,8 +24,17 @@ func SendHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	v, ok := connectionPool.Load(msg.Receiver)
+	if !ok {
+		http.Error(w, `{"success":false,"error":{"code":"CONNECTION_NOT_FOUND","message":"no connection to receiver"}}`, http.StatusBadGateway)
+		return
+	}
+	conn := v.(net.Conn)
+
+	fmt.Println("[logs] Conection found in pool with ip :- ",msg.Receiver)
+
 	start := time.Now()
-	if err := transfer.Send_TCP(msg); err != nil {
+	if err := transfer.Send_TCP(msg,conn); err != nil {
 		http.Error(w, fmt.Sprintf(`{"success":false,"error":{"code":"FORWARDING_FAILED","message":%q}}`, err.Error()), http.StatusBadGateway)
 		return
 	}
@@ -47,14 +56,15 @@ func SendHandler(w http.ResponseWriter, r *http.Request) {
 // ======================
 // /scan endpoint
 // ======================
+
 func ScanHandler(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	devices := []string{}
 	for i := 1; i <= 255; i++ {
 		ip := fmt.Sprintf("%s%d", config.IPBase, i)
 		if conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", ip, config.TCPPort), 100*time.Millisecond); err == nil {
-			_ = conn.Close()
 			devices = append(devices, ip)
+			go establishConnection(conn)
 		}
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -62,6 +72,34 @@ func ScanHandler(w http.ResponseWriter, r *http.Request) {
 		"devices": devices,
 		"duration_ms": time.Since(start).Milliseconds(),
 	})
+}
+
+
+
+
+
+
+func establishConnection(conn net.Conn) {
+    host, _, _ := net.SplitHostPort(conn.RemoteAddr().String()) // <- extract IP only
+    fmt.Println("[logs] Persistent connection established :- ", host)
+
+    // Keep the most recent conn for this IP
+    if old, loaded := connectionPool.LoadAndDelete(host); loaded {
+        if oc, ok := old.(net.Conn); ok && oc != conn { _ = oc.Close() }
+    }
+    connectionPool.Store(host, conn)
+
+    // keep your current “deadline loop” for now; we’ll improve it in step-2
+    for {
+        err := conn.SetDeadline(time.Now().Add(30 * time.Second))
+        if err != nil {
+            fmt.Println("[logs] Device disconnected :- ", err)
+            _ = conn.Close()
+            connectionPool.Delete(host)
+            break
+        }
+        time.Sleep(10 * time.Second)
+    }
 }
 
 
