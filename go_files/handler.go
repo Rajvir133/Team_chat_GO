@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"io"
+	"strings"
 	"net/http"
 	"time"
 
@@ -24,28 +25,60 @@ func SendHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	v, ok := connectionPool.Load(msg.Receiver)
-	if !ok {
-		http.Error(w, `{"success":false,"error":{"code":"CONNECTION_NOT_FOUND","message":"no connection to receiver"}}`, http.StatusBadGateway)
-		return
-	}
-	conn := v.(net.Conn)
-
-	fmt.Println("[logs] Conection found in pool with ip :- ",msg.Receiver)
-
 	start := time.Now()
-	if err := transfer.Send_TCP(msg,conn); err != nil {
-		http.Error(w, fmt.Sprintf(`{"success":false,"error":{"code":"FORWARDING_FAILED","message":%q}}`, err.Error()), http.StatusBadGateway)
-		return
+
+	var conn net.Conn
+
+	if v, ok := connectionPool.Load(msg.Receiver); ok {
+		conn = v.(net.Conn)
+	} else {
+
+		c, err := dialTo(msg.Receiver)
+		if err != nil {
+			http.Error(w, `{"success":false,"error":{"code":"CONNECTION_NOT_FOUND","message":"receiver offline or unreachable"}}`, http.StatusBadGateway)
+			return
+		}
+
+		if old, loaded := connectionPool.LoadAndDelete(msg.Receiver); loaded {
+			if oc, ok := old.(net.Conn); ok && oc != c {
+				_ = oc.Close()
+			}
+		}
+		connectionPool.Store(msg.Receiver, c)
+		conn = c
 	}
+
+	_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	if err := transfer.Send_TCP(msg, conn); err != nil {
+
+		if old, ok := connectionPool.LoadAndDelete(msg.Receiver); ok {
+			if oc, ok2 := old.(net.Conn); ok2 {
+				_ = oc.Close()
+			}
+		}
+
+		c2, err2 := dialTo(msg.Receiver)
+		if err2 != nil {
+			http.Error(w, fmt.Sprintf(`{"success":false,"error":{"code":"FORWARDING_FAILED","message":"%v / retry dial: %v"}}`, err, err2), http.StatusBadGateway)
+			return
+		}
+		connectionPool.Store(msg.Receiver, c2)
+		_ = c2.SetWriteDeadline(time.Now().Add(10 * time.Second))
+
+		if err3 := transfer.Send_TCP(msg, c2); err3 != nil {
+			http.Error(w, fmt.Sprintf(`{"success":false,"error":{"code":"FORWARDING_FAILED","message":"retry send: %v"}}`, err3), http.StatusBadGateway)
+			return
+		}
+	}
+
 	elapsed := time.Since(start)
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
+	_ = json.NewEncoder(w).Encode(map[string]any{
 		"data": map[string]any{
-			"sender":       msg.Sender,
-			"receiver":     msg.Receiver,
-			"message_type": msg.MessageType,
+			"sender":        msg.Sender,
+			"receiver":      msg.Receiver,
+			"message_type":  msg.MessageType,
 			"time_taken_ms": elapsed.Milliseconds(),
 			"time_taken_s":  elapsed.Seconds(),
 		},
@@ -80,28 +113,46 @@ func ScanHandler(w http.ResponseWriter, r *http.Request) {
 
 
 func establishConnection(conn net.Conn) {
-    host, _, _ := net.SplitHostPort(conn.RemoteAddr().String()) // <- extract IP only
-    fmt.Println("[logs] Persistent connection established :- ", host)
+	ip := extractIP(conn.RemoteAddr().String())
+	fmt.Printf("[logs] persistent connection established: %s\n", ip)
 
-    // Keep the most recent conn for this IP
-    if old, loaded := connectionPool.LoadAndDelete(host); loaded {
-        if oc, ok := old.(net.Conn); ok && oc != conn { _ = oc.Close() }
-    }
-    connectionPool.Store(host, conn)
+	if tcp, ok := conn.(*net.TCPConn); ok {
+		_ = tcp.SetKeepAlive(true)
+		_ = tcp.SetKeepAlivePeriod(30 * time.Second)
+		_ = tcp.SetNoDelay(true)
+	}
 
-    // keep your current “deadline loop” for now; we’ll improve it in step-2
-    for {
-        err := conn.SetDeadline(time.Now().Add(30 * time.Second))
-        if err != nil {
-            fmt.Println("[logs] Device disconnected :- ", err)
-            _ = conn.Close()
-            connectionPool.Delete(host)
-            break
-        }
-        time.Sleep(10 * time.Second)
-    }
+	// Keep the freshest conn for this IP
+	if old, loaded := connectionPool.LoadAndDelete(ip); loaded {
+		if oc, ok := old.(net.Conn); ok && oc != conn {
+			_ = oc.Close()
+		}
+	}
+	connectionPool.Store(ip, conn)
 }
 
+func extractIP(addr string) string {
+	if host, _, err := net.SplitHostPort(addr); err == nil {
+		return host
+	}
+	if i := strings.LastIndex(addr, ":"); i != -1 {
+		return addr[:i]
+	}
+	return addr
+}
+
+func dialTo(ip string) (net.Conn, error) {
+	c, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", ip, config.TCPPort), 2*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	if tcp, ok := c.(*net.TCPConn); ok {
+		_ = tcp.SetKeepAlive(true)
+		_ = tcp.SetKeepAlivePeriod(30 * time.Second)
+		_ = tcp.SetNoDelay(true)
+	}
+	return c, nil
+}
 
 
 
@@ -117,13 +168,12 @@ func create_payload(r *http.Request) (config.Message, error) {
         Message:     r.FormValue("message"),
     }
 
-    if msg.Sender == "" || msg.Receiver == "" || msg.MessageType == "" {
+    if msg.Sender == "" || msg.Receiver == "" {
         return config.Message{}, fmt.Errorf("required fields missing")
     }
 
-    msg.Payload = make([]config.FilePayload, 0) 
-
-	if msg.MessageType != "text" && r.MultipartForm != nil {
+	msg.Payload = make([]config.FilePayload, 0)
+	if r.MultipartForm != nil {
 		if fhs, ok := r.MultipartForm.File["files"]; ok {
 			for _, fh := range fhs {
 				f, err := fh.Open()
@@ -135,16 +185,13 @@ func create_payload(r *http.Request) (config.Message, error) {
 				if err != nil {
 					return config.Message{}, fmt.Errorf("read %s: %w", fh.Filename, err)
 				}
-
 				if len(data) == 0 {
 					continue
 				}
-
 				ct := fh.Header.Get("Content-Type")
 				if ct == "" {
 					ct = "application/octet-stream"
 				}
-
 				msg.Payload = append(msg.Payload, config.FilePayload{
 					Name: fh.Filename, Type: ct, Data: data,
 				})
@@ -152,8 +199,10 @@ func create_payload(r *http.Request) (config.Message, error) {
 		}
 	}
 
-	// if no usable files, treat it as a text message
-	if len(msg.Payload) == 0 {
+	// Auto-set message_type
+	if len(msg.Payload) > 0 {
+		msg.MessageType = "file"
+	} else {
 		msg.MessageType = "text"
 	}
 

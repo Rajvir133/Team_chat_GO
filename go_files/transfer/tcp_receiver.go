@@ -44,100 +44,104 @@ func StartTCPServer(port int) {
 
 
 func handleTCPConnection(conn net.Conn) {
-	defer conn.Close()
-	reader := bufio.NewReader(conn)
+    // keep the socket healthy
+    if tcp, ok := conn.(*net.TCPConn); ok {
+        _ = tcp.SetKeepAlive(true)
+        _ = tcp.SetKeepAlivePeriod(30 * time.Second)
+        _ = tcp.SetNoDelay(true)
+    }
+    defer conn.Close()
 
-	metaLine, err := reader.ReadString('\n')
-	if err != nil {
-		fmt.Println("[!] Failed to read metadata:", err)
-		return
-	}
+    reader := bufio.NewReader(conn)
 
-	// Try as "text" path first (config.Message)
-	var msg config.Message
-	if err := json.Unmarshal([]byte(metaLine), &msg); err == nil {
-		if msg.MessageType == "text" {
-			metadata := config.FileMetadata{
-				Sender:   msg.Sender,
-				Receiver: msg.Receiver,
-				Type:     msg.MessageType,
-				Message:  msg.Message,
-				Name:     "",
-				Size:     0,
-				Chunks:   0,
-				Hash:     "",
-			}
+    for {
+        // 1) Read one metadata line (either text message or file metadata)
+        metaLine, err := reader.ReadString('\n')
+        if err != nil {
+            fmt.Println("[TCP] connection closed/read error:", err)
+            return
+        }
 
-			go notifyFastAPI(metadata, nil)
-			fmt.Println("[logs] Text message sent to FastAPI")
-			return
-		}
-	}
+        // 2) Try TEXT path first
+        var msg config.Message
+        if err := json.Unmarshal([]byte(metaLine), &msg); err == nil && msg.MessageType == "text" {
+            metadata := config.FileMetadata{
+                Sender:   msg.Sender,
+                Receiver: msg.Receiver,
+                Type:     "text",
+                Message:  msg.Message,
+            }
+            go notifyFastAPI(metadata, nil)
+            fmt.Println("[logs] text relayed to FastAPI; keeping TCP open")
+            continue // stay on same socket
+        }
 
-	// Otherwise parse as file metadata
-	var metadata config.FileMetadata
-	if err := json.Unmarshal([]byte(metaLine), &metadata); err != nil {
-		fmt.Println("[Error] Invalid metadata:", err)
-		return
-	}
+        // 3) Otherwise treat it as FILE metadata
+        var metadata config.FileMetadata
+        if err := json.Unmarshal([]byte(metaLine), &metadata); err != nil {
+            fmt.Println("[Error] invalid metadata JSON:", err)
+            // bad frame; don't kill socket—wait for next
+            continue
+        }
 
-	fmt.Printf("[logs] Incoming file : %s , %d , %d, %s , %s\n",
-		metadata.Name, metadata.Size, metadata.Chunks, metadata.Sender, metadata.Type)
+        // 4) Create ephemeral UDP listener for this ONE transfer
+        udpAddr, err := net.ResolveUDPAddr("udp", ":0")
+        if err != nil {
+            fmt.Println("[Error] resolve UDP addr:", err)
+            continue
+        }
+        udpConn, err := net.ListenUDP("udp", udpAddr)
+        if err != nil {
+            fmt.Println("[Error] listen UDP:", err)
+            continue
+        }
+        _ = udpConn.SetReadBuffer(4 << 20)
+        udpPort := udpConn.LocalAddr().(*net.UDPAddr).Port
 
-	udpAddr, err := net.ResolveUDPAddr("udp", ":0")
-	if err != nil {
-		fmt.Println("[Error] resolve UDP addr:", err)
-		return
-	}
-	udpConn, err := net.ListenUDP("udp", udpAddr)
-	if err != nil {
-		fmt.Println("[Error] listen UDP:", err)
-		return
-	}
-	_ = udpConn.SetReadBuffer(4 << 20)
-	
-	udpPort := udpConn.LocalAddr().(*net.UDPAddr).Port
+        // 5) Tell sender which UDP port to use
+        if _, err := conn.Write([]byte(fmt.Sprintf("Start:%d\n", udpPort))); err != nil {
+            fmt.Println("[Error] TCP write Start:", err)
+            udpConn.Close()
+            continue
+        }
 
-	fmt.Printf("[TCP] start : %d\n", udpPort)
-	if _, err := conn.Write([]byte(fmt.Sprintf("Start:%d\n", udpPort))); err != nil {
-		fmt.Println("[Error] failed to write start:", err)
-		udpConn.Close()
-		return
-	}
+        // 6) Receive chunks over UDP; ACKs go back on this same TCP socket
+        fileDataChan := make(chan []byte, 1)
+        done := make(chan struct{}, 1)
 
-	// Deadlock-safe: buffered result + signal-only done
-	fileDataChan := make(chan []byte, 1)
-	done := make(chan struct{}, 1)
+        go func() {
+            combined := StartUDPReceiverConn(udpConn, metadata, conn, done)
+            fileDataChan <- combined
+        }()
 
-	go func() {
-		fileBytes := StartUDPReceiverConn(udpConn, metadata, conn, done)
-		fileDataChan <- fileBytes
-	}()
+        // 7) Wait for receive to finish (or timeout)
+        select {
+        case <-done:
+            combined := <-fileDataChan
+            if combined == nil && metadata.Size > 0 {
+                fmt.Println("[logs] receive failed (nil data)")
+                _, _ = conn.Write([]byte("error:receive_failed\n"))
+                udpConn.Close()
+                continue
+            }
+            // signal stop-of-acks and close UDP
+            _, _ = conn.Write([]byte("stop\n"))
+            udpConn.Close()
 
-	select {
-	case <-done:
-		combinedFileData := <-fileDataChan
-		if combinedFileData == nil && metadata.Size > 0 {
-			fmt.Println("[logs] receive failed (nil data)")
-			_, _ = conn.Write([]byte("error:receive_failed\n"))
-			udpConn.Close()
-			return
-		}
+            // hand off to FastAPI (multipart or whatever your notify does)
+            go notifyFastAPI(metadata, combined)
+            fmt.Println("[logs] file delivered; keeping TCP open")
 
-		fmt.Println("[logs] all chunk received")
-		_, _ = conn.Write([]byte("stop\n"))
-		fmt.Println("[TCP] sending stop")
+        case <-time.After(120 * time.Second):
+            fmt.Println("[logs] timeout waiting for file data")
+            udpConn.Close()
+            _, _ = conn.Write([]byte("error:timeout\n"))
+        }
 
-		udpConn.Close()
-
-		go notifyFastAPI(metadata, combinedFileData)
-
-	case <-time.After(120 * time.Second):
-		fmt.Println("[logs] Timeout waiting for file")
-		udpConn.Close()
-		_, _ = conn.Write([]byte("error:timeout\n"))
-	}
+        // loop again for next text/file on the same TCP conn
+    }
 }
+
 
 
 
