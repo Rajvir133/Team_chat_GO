@@ -1,16 +1,24 @@
 package config
 
+import(
+	"os"
+	"fmt"
+	"net"
+	)
+
 
 // ======== Configuration constants ========
 const (
 	HTTPPort     = 8080
-	TCPPort      = 9200
+	TCPPort      = 9000
 	ChunkSize    = 22768      // change this size from 32 kb to 22kb
 	AckTimeoutMs = 10000
 	MaxRetries   = 3
+	Max_connection_retry = 3
 	IPBase       = "192.168.29."
 	FastAPIHost  = "127.0.0.1"
 	FastAPIPort  = 5000
+	Device_type	= "BMS"
 )
 
 // ======== File type handling ========
@@ -61,4 +69,11 @@ func CalculateChunks(fileSize int) int {
 		chunks++
 	}
 	return chunks
+}
+
+func Send_identity(conn net.Conn) {
+    host, _ := os.Hostname()
+    if host == "" { host = "unknown" }
+    _, _ = fmt.Fprintf(conn, "%s|%s\n", Device_type,host)
+	fmt.Printf("[ send ] %s|%s -------> \n",Device_type,host)
 }

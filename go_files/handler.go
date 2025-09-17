@@ -29,34 +29,47 @@ func SendHandler(w http.ResponseWriter, r *http.Request) {
 
 	var conn net.Conn
 
+	// 1) Try to reuse pooled connection
 	if v, ok := connectionPool.Load(msg.Receiver); ok {
 		conn = v.(net.Conn)
+		fmt.Println("[logs] Found existing connection ")
 	} else {
-
-		c, err := dialTo(msg.Receiver)
-		if err != nil {
-			http.Error(w, `{"success":false,"error":{"code":"CONNECTION_NOT_FOUND","message":"receiver offline or unreachable"}}`, http.StatusBadGateway)
-			return
-		}
-
-		if old, loaded := connectionPool.LoadAndDelete(msg.Receiver); loaded {
-			if oc, ok := old.(net.Conn); ok && oc != c {
-				_ = oc.Close()
+		// 2) Pool miss: log and attempt up to MaxRetries to dial
+		fmt.Println("[logs] Connection not found creating new connection")
+		var dconn net.Conn
+		var derr error
+		for attempt := 1; attempt <= config.Max_connection_retry; attempt++ {
+			dconn, derr = dialTo(msg.Receiver)
+			if derr == nil {
+				// replace any stale mapping, store fresh
+				if old, loaded := connectionPool.LoadAndDelete(msg.Receiver); loaded {
+					if oc, ok := old.(net.Conn); ok && oc != dconn {
+						_ = oc.Close()
+					}
+				}
+				storeOutgoingConn(msg.Receiver, dconn)
+				fmt.Printf("[logs] Connection made at attempt %d  and added in pool\n", attempt)
+				conn = dconn
+				break
 			}
 		}
-		connectionPool.Store(msg.Receiver, c)
-		conn = c
+		if conn == nil {
+			fmt.Println("[logs] Device is offline")
+			http.Error(w, `{"success":false,"error":{"code":"CONNECTION_NOT_FOUND","message":"device is offline"}}`, http.StatusBadGateway)
+			return
+		}
 	}
 
+	// 3) Send (with one retry on send failure)
 	_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 	if err := transfer.Send_TCP(msg, conn); err != nil {
-
+		// purge stale & close
 		if old, ok := connectionPool.LoadAndDelete(msg.Receiver); ok {
 			if oc, ok2 := old.(net.Conn); ok2 {
 				_ = oc.Close()
 			}
 		}
-
+		// redial once and retry send
 		c2, err2 := dialTo(msg.Receiver)
 		if err2 != nil {
 			http.Error(w, fmt.Sprintf(`{"success":false,"error":{"code":"FORWARDING_FAILED","message":"%v / retry dial: %v"}}`, err, err2), http.StatusBadGateway)
@@ -84,6 +97,7 @@ func SendHandler(w http.ResponseWriter, r *http.Request) {
 		},
 	})
 }
+
 
 
 // ======================
@@ -115,6 +129,7 @@ func ScanHandler(w http.ResponseWriter, r *http.Request) {
 func establishConnection(conn net.Conn) {
 	ip := extractIP(conn.RemoteAddr().String())
 	fmt.Printf("[logs] persistent connection established: %s\n", ip)
+	config.Send_identity(conn)
 
 	if tcp, ok := conn.(*net.TCPConn); ok {
 		_ = tcp.SetKeepAlive(true)
@@ -128,7 +143,7 @@ func establishConnection(conn net.Conn) {
 			_ = oc.Close()
 		}
 	}
-	connectionPool.Store(ip, conn)
+	storeOutgoingConn(ip, conn)
 }
 
 func extractIP(addr string) string {
@@ -151,6 +166,7 @@ func dialTo(ip string) (net.Conn, error) {
 		_ = tcp.SetKeepAlivePeriod(30 * time.Second)
 		_ = tcp.SetNoDelay(true)
 	}
+	config.Send_identity(c)
 	return c, nil
 }
 
@@ -199,12 +215,12 @@ func create_payload(r *http.Request) (config.Message, error) {
 		}
 	}
 
-	// Auto-set message_type
-	if len(msg.Payload) > 0 {
-		msg.MessageType = "file"
-	} else {
-		msg.MessageType = "text"
-	}
+	// // Auto-set message_type
+	// if len(msg.Payload) > 0 {
+	// 	msg.MessageType = msg.MessageType
+	// } else {
+	// 	msg.MessageType = "text"
+	// }
 
 	return msg, nil
 }
