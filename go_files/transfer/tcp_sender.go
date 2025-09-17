@@ -3,7 +3,6 @@ package transfer
 import (
 	"bufio"
 	"crypto/sha256"
-	"time"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -13,13 +12,8 @@ import (
 	"go_files/config"
 )
 
-func Send_TCP(msg config.Message) error {
-	d := net.Dialer{KeepAlive: 30 * time.Second, Timeout: 10 * time.Second}
-	conn, err := d.Dial("tcp", fmt.Sprintf("%s:%d", msg.Receiver, config.TCPPort))
-	if err != nil {
-		return fmt.Errorf("[logs] TCP connect error: %v", err)
-	}
-	defer conn.Close()
+func Send_TCP(msg config.Message, conn net.Conn) error {
+
 	if tcp, ok := conn.(*net.TCPConn); ok {
 		_ = tcp.SetNoDelay(true)
 	}

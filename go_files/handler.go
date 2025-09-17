@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"io"
+	"strings"
 	"net/http"
 	"time"
 
@@ -25,18 +26,72 @@ func SendHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	start := time.Now()
-	if err := transfer.Send_TCP(msg); err != nil {
-		http.Error(w, fmt.Sprintf(`{"success":false,"error":{"code":"FORWARDING_FAILED","message":%q}}`, err.Error()), http.StatusBadGateway)
-		return
+
+	var conn net.Conn
+
+	// 1) Try to reuse pooled connection
+	if v, ok := connectionPool.Load(msg.Receiver); ok {
+		conn = v.(net.Conn)
+		fmt.Println("[logs] Found existing connection ")
+	} else {
+		// 2) Pool miss: log and attempt up to MaxRetries to dial
+		fmt.Println("[logs] Connection not found creating new connection")
+		var dconn net.Conn
+		var derr error
+		for attempt := 1; attempt <= config.Max_connection_retry; attempt++ {
+			dconn, derr = dialTo(msg.Receiver)
+			if derr == nil {
+				// replace any stale mapping, store fresh
+				if old, loaded := connectionPool.LoadAndDelete(msg.Receiver); loaded {
+					if oc, ok := old.(net.Conn); ok && oc != dconn {
+						_ = oc.Close()
+					}
+				}
+				storeOutgoingConn(msg.Receiver, dconn)
+				fmt.Printf("[logs] Connection made at attempt %d  and added in pool\n", attempt)
+				conn = dconn
+				break
+			}
+		}
+		if conn == nil {
+			fmt.Println("[logs] Device is offline")
+			http.Error(w, `{"success":false,"error":{"code":"CONNECTION_NOT_FOUND","message":"device is offline"}}`, http.StatusBadGateway)
+			return
+		}
 	}
+
+	// 3) Send (with one retry on send failure)
+	_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+	if err := transfer.Send_TCP(msg, conn); err != nil {
+		// purge stale & close
+		if old, ok := connectionPool.LoadAndDelete(msg.Receiver); ok {
+			if oc, ok2 := old.(net.Conn); ok2 {
+				_ = oc.Close()
+			}
+		}
+		// redial once and retry send
+		c2, err2 := dialTo(msg.Receiver)
+		if err2 != nil {
+			http.Error(w, fmt.Sprintf(`{"success":false,"error":{"code":"FORWARDING_FAILED","message":"%v / retry dial: %v"}}`, err, err2), http.StatusBadGateway)
+			return
+		}
+		connectionPool.Store(msg.Receiver, c2)
+		_ = c2.SetWriteDeadline(time.Now().Add(10 * time.Second))
+
+		if err3 := transfer.Send_TCP(msg, c2); err3 != nil {
+			http.Error(w, fmt.Sprintf(`{"success":false,"error":{"code":"FORWARDING_FAILED","message":"retry send: %v"}}`, err3), http.StatusBadGateway)
+			return
+		}
+	}
+
 	elapsed := time.Since(start)
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]any{
+	_ = json.NewEncoder(w).Encode(map[string]any{
 		"data": map[string]any{
-			"sender":       msg.Sender,
-			"receiver":     msg.Receiver,
-			"message_type": msg.MessageType,
+			"sender":        msg.Sender,
+			"receiver":      msg.Receiver,
+			"message_type":  msg.MessageType,
 			"time_taken_ms": elapsed.Milliseconds(),
 			"time_taken_s":  elapsed.Seconds(),
 		},
@@ -44,17 +99,19 @@ func SendHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 
+
 // ======================
 // /scan endpoint
 // ======================
+
 func ScanHandler(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	devices := []string{}
 	for i := 1; i <= 255; i++ {
 		ip := fmt.Sprintf("%s%d", config.IPBase, i)
 		if conn, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", ip, config.TCPPort), 100*time.Millisecond); err == nil {
-			_ = conn.Close()
 			devices = append(devices, ip)
+			go establishConnection(conn)
 		}
 	}
 	w.Header().Set("Content-Type", "application/json")
@@ -64,6 +121,54 @@ func ScanHandler(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+
+
+
+
+
+func establishConnection(conn net.Conn) {
+	ip := extractIP(conn.RemoteAddr().String())
+	fmt.Printf("[logs] persistent connection established: %s\n", ip)
+	config.Send_identity(conn)
+
+	if tcp, ok := conn.(*net.TCPConn); ok {
+		_ = tcp.SetKeepAlive(true)
+		_ = tcp.SetKeepAlivePeriod(30 * time.Second)
+		_ = tcp.SetNoDelay(true)
+	}
+
+	// Keep the freshest conn for this IP
+	if old, loaded := connectionPool.LoadAndDelete(ip); loaded {
+		if oc, ok := old.(net.Conn); ok && oc != conn {
+			_ = oc.Close()
+		}
+	}
+	storeOutgoingConn(ip, conn)
+}
+
+func extractIP(addr string) string {
+	if host, _, err := net.SplitHostPort(addr); err == nil {
+		return host
+	}
+	if i := strings.LastIndex(addr, ":"); i != -1 {
+		return addr[:i]
+	}
+	return addr
+}
+
+func dialTo(ip string) (net.Conn, error) {
+	c, err := net.DialTimeout("tcp", fmt.Sprintf("%s:%d", ip, config.TCPPort), 2*time.Second)
+	if err != nil {
+		return nil, err
+	}
+	if tcp, ok := c.(*net.TCPConn); ok {
+		_ = tcp.SetKeepAlive(true)
+		_ = tcp.SetKeepAlivePeriod(30 * time.Second)
+		_ = tcp.SetNoDelay(true)
+	}
+	config.Send_identity(c)
+	return c, nil
+}
 
 
 
@@ -79,13 +184,12 @@ func create_payload(r *http.Request) (config.Message, error) {
         Message:     r.FormValue("message"),
     }
 
-    if msg.Sender == "" || msg.Receiver == "" || msg.MessageType == "" {
+    if msg.Sender == "" || msg.Receiver == "" {
         return config.Message{}, fmt.Errorf("required fields missing")
     }
 
-    msg.Payload = make([]config.FilePayload, 0) 
-
-	if msg.MessageType != "text" && r.MultipartForm != nil {
+	msg.Payload = make([]config.FilePayload, 0)
+	if r.MultipartForm != nil {
 		if fhs, ok := r.MultipartForm.File["files"]; ok {
 			for _, fh := range fhs {
 				f, err := fh.Open()
@@ -97,16 +201,13 @@ func create_payload(r *http.Request) (config.Message, error) {
 				if err != nil {
 					return config.Message{}, fmt.Errorf("read %s: %w", fh.Filename, err)
 				}
-
 				if len(data) == 0 {
 					continue
 				}
-
 				ct := fh.Header.Get("Content-Type")
 				if ct == "" {
 					ct = "application/octet-stream"
 				}
-
 				msg.Payload = append(msg.Payload, config.FilePayload{
 					Name: fh.Filename, Type: ct, Data: data,
 				})
@@ -114,10 +215,12 @@ func create_payload(r *http.Request) (config.Message, error) {
 		}
 	}
 
-	// if no usable files, treat it as a text message
-	if len(msg.Payload) == 0 {
-		msg.MessageType = "text"
-	}
+	// // Auto-set message_type
+	// if len(msg.Payload) > 0 {
+	// 	msg.MessageType = msg.MessageType
+	// } else {
+	// 	msg.MessageType = "text"
+	// }
 
 	return msg, nil
 }

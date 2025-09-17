@@ -9,11 +9,24 @@ import (
 	"net"
 	"io"
 	"net/http"
+	"strings"
 	"time"
 	"net/textproto"
 
 	"go_files/config"
 )
+
+
+var onConnClosed func(ip string, conn net.Conn)
+var onConnReady  func(ip string, conn net.Conn)
+
+func SetOnConnClosed(fn func(ip string, conn net.Conn)) {
+	onConnClosed = fn
+}
+func SetOnConnReady(fn func(ip string, conn net.Conn))  { 
+	onConnReady  = fn 
+}
+
 
 func StartTCPServer(port int) {
     listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
@@ -29,6 +42,13 @@ func StartTCPServer(port int) {
             continue
         }
 
+		remote := conn.RemoteAddr().String()
+        ip := extractIP(remote)
+
+        // 👇 NEW: log that a new connection request arrived
+        fmt.Printf("[TCP] new connection request from %s\n", ip)
+
+
         // 🔐 Keep socket healthy across NATs and reduce ACK latency
         if tcp, ok := conn.(*net.TCPConn); ok {
             _ = tcp.SetKeepAlive(true)
@@ -41,103 +61,183 @@ func StartTCPServer(port int) {
 }
 
 
-
-
 func handleTCPConnection(conn net.Conn) {
-	defer conn.Close()
+
+    if tcp, ok := conn.(*net.TCPConn); ok {
+        _ = tcp.SetKeepAlive(true)
+        _ = tcp.SetKeepAlivePeriod(30 * time.Second)
+        _ = tcp.SetNoDelay(true)
+    }
+
+
+	defer func() {
+		ip := extractIP(conn.RemoteAddr().String())
+		if onConnClosed != nil {
+			onConnClosed(ip, conn)
+		}
+		_ = conn.Close()
+	}()
+
 	reader := bufio.NewReader(conn)
 
-	metaLine, err := reader.ReadString('\n')
-	if err != nil {
-		fmt.Println("[!] Failed to read metadata:", err)
+
+	var pending string
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	firstLine, err := reader.ReadString('\n')
+	_ = conn.SetReadDeadline(time.Time{})
+
+	if err == nil {
+		line := strings.TrimSpace(firstLine)
+		if i := strings.Index(line, "|"); i > 0 {
+			tag := strings.TrimSpace(line[:i])
+			host  := strings.TrimSpace(line[i+1:])
+			if tag == "BMS" || tag == "CMK" {
+				ip := extractIP(conn.RemoteAddr().String())
+				fmt.Printf("[ receive ] Received %s|%s from %s \n",host, tag,ip)
+				
+				config.Send_identity(conn)
+			} else {
+				// not an ID; treat it as the first normal frame later
+				pending = firstLine
+			}
+		} else {
+			// not an ID; treat it as the first normal frame later
+			pending = firstLine
+		}
+	} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
+		// no ID arrived (old peer) — proceed without sending ours
+	} else if err != nil {
+		fmt.Println("[TCP] read error during identification:", err)
 		return
 	}
+	
+	if onConnReady != nil {
+		ip := extractIP(conn.RemoteAddr().String())
+		onConnReady(ip, conn)
+	}
 
-	// Try as "text" path first (config.Message)
-	var msg config.Message
-	if err := json.Unmarshal([]byte(metaLine), &msg); err == nil {
-		if msg.MessageType == "text" {
+	for {
+		// 1) Read one metadata line (either text message or file metadata)
+		var metaLine string
+		if pending != "" {
+			metaLine = pending
+			pending = ""
+		} else {
+			var err error
+			metaLine, err = reader.ReadString('\n')
+			if err != nil {
+				fmt.Println("[logs] closed the connection",extractIP(conn.RemoteAddr().String()), err)
+				return
+			}
+		}
+
+
+
+		line := strings.TrimSpace(metaLine)
+
+		if line == "PING" {
+			_, _ = conn.Write([]byte("PONG\n"))
+			fmt.Println("[hb] got PING, sent PONG")
+			continue
+		}
+		if line == "PONG" {
+			fmt.Println("[hb] got PONG (ignored)")
+			continue
+		}
+
+
+		if i := strings.Index(line, "|"); i > 0 {
+			host := strings.TrimSpace(line[:i])
+			tag  := strings.TrimSpace(line[i+1:])
+			if tag == "BMS" || tag == "CMK" {
+				ip := extractIP(conn.RemoteAddr().String())
+				fmt.Printf("[id] peer identified (late) ip=%s host=%s tag=%s\n", ip, host, tag)
+				continue
+			}
+    	}
+
+
+
+		// 2) Try TEXT path first
+		var msg config.Message
+		if err := json.Unmarshal([]byte(metaLine), &msg); err == nil && msg.MessageType == "text" {
 			metadata := config.FileMetadata{
 				Sender:   msg.Sender,
 				Receiver: msg.Receiver,
-				Type:     msg.MessageType,
+				Type:     "text",
 				Message:  msg.Message,
-				Name:     "",
-				Size:     0,
-				Chunks:   0,
-				Hash:     "",
 			}
-
 			go notifyFastAPI(metadata, nil)
-			fmt.Println("[logs] Text message sent to FastAPI")
-			return
+			fmt.Println("[logs] text relayed to FastAPI; keeping TCP open")
+			continue // stay on same socket
 		}
-	}
 
-	// Otherwise parse as file metadata
-	var metadata config.FileMetadata
-	if err := json.Unmarshal([]byte(metaLine), &metadata); err != nil {
-		fmt.Println("[Error] Invalid metadata:", err)
-		return
-	}
+		// 3) Otherwise treat it as FILE metadata
+		var metadata config.FileMetadata
+		if err := json.Unmarshal([]byte(metaLine), &metadata); err != nil {
+			fmt.Println("[Error] invalid metadata JSON:", err)
+			// bad frame; don't kill socket—wait for next
+			continue
+		}
 
-	fmt.Printf("[logs] Incoming file : %s , %d , %d, %s , %s\n",
-		metadata.Name, metadata.Size, metadata.Chunks, metadata.Sender, metadata.Type)
+		// 4) Create ephemeral UDP listener for this ONE transfer
+		udpAddr, err := net.ResolveUDPAddr("udp", ":0")
+		if err != nil {
+			fmt.Println("[Error] resolve UDP addr:", err)
+			continue
+		}
+		udpConn, err := net.ListenUDP("udp", udpAddr)
+		if err != nil {
+			fmt.Println("[Error] listen UDP:", err)
+			continue
+		}
+		_ = udpConn.SetReadBuffer(4 << 20)
+		udpPort := udpConn.LocalAddr().(*net.UDPAddr).Port
 
-	udpAddr, err := net.ResolveUDPAddr("udp", ":0")
-	if err != nil {
-		fmt.Println("[Error] resolve UDP addr:", err)
-		return
-	}
-	udpConn, err := net.ListenUDP("udp", udpAddr)
-	if err != nil {
-		fmt.Println("[Error] listen UDP:", err)
-		return
-	}
-	_ = udpConn.SetReadBuffer(4 << 20)
-	
-	udpPort := udpConn.LocalAddr().(*net.UDPAddr).Port
-
-	fmt.Printf("[TCP] start : %d\n", udpPort)
-	if _, err := conn.Write([]byte(fmt.Sprintf("Start:%d\n", udpPort))); err != nil {
-		fmt.Println("[Error] failed to write start:", err)
-		udpConn.Close()
-		return
-	}
-
-	// Deadlock-safe: buffered result + signal-only done
-	fileDataChan := make(chan []byte, 1)
-	done := make(chan struct{}, 1)
-
-	go func() {
-		fileBytes := StartUDPReceiverConn(udpConn, metadata, conn, done)
-		fileDataChan <- fileBytes
-	}()
-
-	select {
-	case <-done:
-		combinedFileData := <-fileDataChan
-		if combinedFileData == nil && metadata.Size > 0 {
-			fmt.Println("[logs] receive failed (nil data)")
-			_, _ = conn.Write([]byte("error:receive_failed\n"))
+		// 5) Tell sender which UDP port to use
+		if _, err := conn.Write([]byte(fmt.Sprintf("Start:%d\n", udpPort))); err != nil {
+			fmt.Println("[Error] TCP write Start:", err)
 			udpConn.Close()
-			return
+			continue
 		}
 
-		fmt.Println("[logs] all chunk received")
-		_, _ = conn.Write([]byte("stop\n"))
-		fmt.Println("[TCP] sending stop")
+		// 6) Receive chunks over UDP; ACKs go back on this same TCP socket
+		fileDataChan := make(chan []byte, 1)
+		done := make(chan struct{}, 1)
 
-		udpConn.Close()
+		go func() {
+			combined := StartUDPReceiverConn(udpConn, metadata, conn, done)
+			fileDataChan <- combined
+		}()
 
-		go notifyFastAPI(metadata, combinedFileData)
+		// 7) Wait for receive to finish (or timeout)
+		select {
+		case <-done:
+			combined := <-fileDataChan
+			if combined == nil && metadata.Size > 0 {
+				fmt.Println("[logs] receive failed (nil data)")
+				_, _ = conn.Write([]byte("error:receive_failed\n"))
+				udpConn.Close()
+				continue
+			}
+			// signal stop-of-acks and close UDP
+			_, _ = conn.Write([]byte("stop\n"))
+			udpConn.Close()
 
-	case <-time.After(120 * time.Second):
-		fmt.Println("[logs] Timeout waiting for file")
-		udpConn.Close()
-		_, _ = conn.Write([]byte("error:timeout\n"))
+			// hand off to FastAPI (multipart or whatever your notify does)
+			go notifyFastAPI(metadata, combined)
+			fmt.Println("[logs] file delivered; keeping TCP open")
+
+		case <-time.After(120 * time.Second):
+			fmt.Println("[logs] timeout waiting for file data")
+			udpConn.Close()
+			_, _ = conn.Write([]byte("error:timeout\n"))
+		}
+
+		// loop again for next text/file on the same TCP conn
 	}
 }
+
 
 
 
@@ -200,4 +300,18 @@ func notifyFastAPI(metadata config.FileMetadata, combinedFileData []byte) error 
 	fmt.Printf("[✓] Notified FastAPI (multipart) about %s (%d bytes, type %s)\n",
 		metadata.Name, len(combinedFileData), metadata.Type)
 	return nil
+}
+
+
+
+
+
+func extractIP(addr string) string {
+	if host, _, err := net.SplitHostPort(addr); err == nil {
+		return host
+	}
+	if i := strings.LastIndex(addr, ":"); i != -1 {
+		return addr[:i]
+	}
+	return addr
 }
