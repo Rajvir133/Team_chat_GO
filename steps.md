@@ -8,7 +8,9 @@ pip install -r requirements.txt
 uvicorn app.main:app --reload --port 5000
 
 #terminal 2
-go run go_c/main.go
+cd go_files
+go run .
 
+<!-- 
 #if want to store detail logs 
-go run go_c/main.go > go_c/app.log 2>&1
+go run go_c/main.go > go_c/app.log 2>&1 -->
