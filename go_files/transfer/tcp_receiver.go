@@ -81,7 +81,7 @@ func handleTCPConnection(conn net.Conn) {
 	reader := bufio.NewReader(conn)
 
 
-	var pending string
+	var raw_msg string
 	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
 	firstLine, err := reader.ReadString('\n')
 	_ = conn.SetReadDeadline(time.Time{})
@@ -98,11 +98,11 @@ func handleTCPConnection(conn net.Conn) {
 				config.Send_identity(conn)
 			} else {
 				// not an ID; treat it as the first normal frame later
-				pending = firstLine
+				raw_msg = firstLine
 			}
 		} else {
 			// not an ID; treat it as the first normal frame later
-			pending = firstLine
+			raw_msg = firstLine
 		}
 	} else if ne, ok := err.(net.Error); ok && ne.Timeout() {
 		// no ID arrived (old peer) — proceed without sending ours
@@ -119,9 +119,9 @@ func handleTCPConnection(conn net.Conn) {
 	for {
 		// 1) Read one metadata line (either text message or file metadata)
 		var metaLine string
-		if pending != "" {
-			metaLine = pending
-			pending = ""
+		if raw_msg != "" {
+			metaLine = raw_msg
+			raw_msg = ""
 		} else {
 			var err error
 			metaLine, err = reader.ReadString('\n')
@@ -131,10 +131,12 @@ func handleTCPConnection(conn net.Conn) {
 			}
 		}
 
-
-
 		line := strings.TrimSpace(metaLine)
-
+		if line == "KEEP_ALIVE"{
+			_, _ = conn.Write([]byte("ALIVE\n"))
+			fmt.Println("[hb] got keep_alive, send alive")
+			continue
+		}
 		if line == "PING" {
 			_, _ = conn.Write([]byte("PONG\n"))
 			fmt.Println("[hb] got PING, sent PONG")
