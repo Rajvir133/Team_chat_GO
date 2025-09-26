@@ -1,24 +1,23 @@
 package config
 
-import(
-	"os"
+import (
 	"fmt"
 	"net"
-	)
-
+	"os"
+)
 
 // ======== Configuration constants ========
 const (
-	HTTPPort     = 8080
-	TCPPort      = 9000
-	ChunkSize    = 22768      // change this size from 32 kb to 22kb
-	AckTimeoutMs = 10000
-	MaxRetries   = 3
+	HTTPPort             = 8080
+	TCPPort              = 9000
+	ChunkSize            = 11768 // change this size from 32 kb to 22kb
+	AckTimeoutMs         = 10000
+	MaxRetries           = 3
 	Max_connection_retry = 3
-	IPBase       = "192.168.29."
-	FastAPIHost  = "127.0.0.1"
-	FastAPIPort  = 5000
-	Device_type	= "BMS"
+	IPBase               = "192.168.29."
+	FastAPIHost          = "127.0.0.1"
+	FastAPIPort          = 5000
+	Device_type          = "BMS"
 )
 
 // ======== File type handling ========
@@ -53,12 +52,14 @@ type FilePayload struct {
 // FileMetadata contains file details before sending
 type FileMetadata struct {
 	Name     string `json:"name"`
-	Type     string `json:"type"`
+	Type     string `json:"type"` // file_type
+	Ext      string `json:"ext"`  // file_extension
 	Size     int    `json:"size"`
-	Chunks   int    `json:"chunks"`
+	Chunks   int    `json:"chunks"` // Total_chunks
 	Hash     string `json:"hash"`
 	Sender   string `json:"sender"`
 	Receiver string `json:"receiver"`
+	Host     string `json:"host"`
 	Message  string `json:"message"`
 }
 
@@ -72,8 +73,10 @@ func CalculateChunks(fileSize int) int {
 }
 
 func Send_identity(conn net.Conn) {
-    host, _ := os.Hostname()
-    if host == "" { host = "unknown" }
-    _, _ = fmt.Fprintf(conn, "%s|%s\n", Device_type,host)
-	fmt.Printf("[ send ] %s|%s -------> \n",Device_type,host)
+	host, _ := os.Hostname()
+	if host == "" {
+		host = "unknown"
+	}
+	_, _ = fmt.Fprintf(conn, "%s|%s\n", Device_type, host)
+	fmt.Printf("[ send ] %s|%s -------> \n", Device_type, host)
 }

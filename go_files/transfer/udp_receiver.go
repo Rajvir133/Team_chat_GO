@@ -82,6 +82,7 @@ func StartUDPReceiverConn(udpConn *net.UDPConn, metadata config.FileMetadata, co
 
 		// Per-chunk ACK back on TCP control channel
 		_, _ = conn.Write([]byte(fmt.Sprintf("chunk%d\n", idx)))
+		// fmt.Println("chunk received ----------- %d\n",idx)
 	}
 
 	// Final end-to-end hash check (matches sender’s metadata.Hash)
