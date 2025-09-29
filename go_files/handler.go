@@ -199,7 +199,7 @@ func establishConnection(conn net.Conn) {
                 host := strings.TrimSpace(s[i+1:])
                 if tag == "BMS" || tag == "CMK" {
                     if transfer.OnIdentity != nil {
-                        transfer.OnIdentity(ip, host)
+                        transfer.OnIdentity(ip, host,tag)
                     }
                     fmt.Printf("[ receive ]  %s|%s from %s <-----------\n",tag, host, ip)
                 }

@@ -52,9 +52,11 @@ func handleTCPConnection(conn net.Conn) {
 		_ = tcp.SetKeepAlivePeriod(30 * time.Second)
 		_ = tcp.SetNoDelay(true)
 	}
-	var ip string
+
+	// Initialize peer IP once; avoid shadowing later
+	ip := extractIP(conn.RemoteAddr().String())
+
 	defer func() {
-		ip = extractIP(conn.RemoteAddr().String())
 		if onConnClosed != nil { onConnClosed(ip, conn) }
 		_ = conn.Close()
 	}()
@@ -73,9 +75,9 @@ func handleTCPConnection(conn net.Conn) {
 			tag  := strings.TrimSpace(line[:i])
 			host := strings.TrimSpace(line[i+1:])
 			if tag == "BMS" || tag == "CMK" {
-				ip := extractIP(conn.RemoteAddr().String())
+				ip = extractIP(conn.RemoteAddr().String())
 				fmt.Printf("[ receive ] %s|%s <---------- %s\n", host, tag, ip)
-				if OnIdentity != nil { OnIdentity(ip, host) }
+				if OnIdentity != nil { OnIdentity(ip, host,tag) }
 				config.Send_identity(conn)
 			} else {
 				raw_msg = firstLine
@@ -91,7 +93,7 @@ func handleTCPConnection(conn net.Conn) {
 	}
 
 	if onConnReady != nil {
-		ip := extractIP(conn.RemoteAddr().String())
+		ip = extractIP(conn.RemoteAddr().String())
 		onConnReady(ip, conn)
 	}
 
@@ -136,21 +138,21 @@ func handleTCPConnection(conn net.Conn) {
 			tag := strings.TrimSpace(line[:i])
 			if tag == "BMS" || tag == "CMK" {
 				host := strings.TrimSpace(line[i+1:])
-				ip := extractIP(conn.RemoteAddr().String())
+				ip = extractIP(conn.RemoteAddr().String())
 				fmt.Printf("[id] peer identified (late) ip=%s host=%s tag=%s\n", ip, host, tag)
-				if OnIdentity != nil { OnIdentity(ip, host) }
+				if OnIdentity != nil { OnIdentity(ip, host,tag) }
 				continue
 			}
 		}
 
-		// 2) TEXT: sender|receiver|text|message|Host
+		// 2) TEXT: sender|receiver|text|TEXT|Host
 		if fields, ok := tryPipe(line); ok && len(fields) >= 5 && strings.EqualFold(fields[3], "text") {
 			metadata := config.FileMetadata{
 				Sender:   fields[0],
 				Receiver: fields[1],
 				Type:     "TEXT",
 				Message:  fields[2],
-				Host:     fields[3],
+				Host:     fields[4],
 			}
 			go notifyFastAPI(metadata, nil)
 			continue
@@ -158,78 +160,76 @@ func handleTCPConnection(conn net.Conn) {
 
 		// 3) FILE (JSON metadata header)
 		if strings.HasPrefix(line, "{") {
-			type tcpMeta struct {
-				Sender       string `json:"sender"`
-				Receiver     string `json:"receiver"`
-				FileName     string `json:"file_name"`
-				FileType     string `json:"file_type"`
-				FileExt      string `json:"file_ext"`
-				FileSize     int    `json:"file_size"`
-				FileChecksum string `json:"file_checksum"`
-				TotalChunks  int    `json:"total_chunks"`
-				Host         string `json:"host"`
-				Transport    string `json:"transport"`
+		type unifiedMeta struct {
+			From      string `json:"from"`
+			To        string `json:"to"`
+			Type      string `json:"type"`
+			Name      string `json:"name"`
+			Ext       string `json:"ext"`
+			Size      int    `json:"size"`
+			Checksum  string `json:"checksum"`
+			Transport string `json:"transport"`
+			XferId    string `json:"xferId"`
+			Marker    string `json:"marker"`
+		}
+		var m unifiedMeta
+		if err := json.Unmarshal([]byte(line), &m); err == nil && (m.Transport == "" || strings.EqualFold(m.Transport, "UDP")) {
+			metadata := config.FileMetadata{
+				Sender: m.From, Receiver: m.To,
+				Name: m.Name, Type: m.Type, Ext: m.Ext,
+				Size: m.Size, Hash: strings.ToLower(m.Checksum),
+				Chunks: config.CalculateChunks(m.Size),
+				Host: m.Marker,
+				XferId: strings.ToLower(m.XferId),
 			}
-			var m tcpMeta
-			if err := json.Unmarshal([]byte(line), &m); err == nil && m.Transport == "UDP" {
-				metadata := config.FileMetadata{
-					Sender: m.Sender, Receiver: m.Receiver,
-					Name: m.FileName, Type: m.FileType, Ext: m.FileExt,
-					Size: m.FileSize, Hash: m.FileChecksum, Chunks: m.TotalChunks,
-					Host: m.Host,
-				}
+			// Create ephemeral UDP listener for this ONE transfer
+			udpAddr, err := net.ResolveUDPAddr("udp", ":0")
+			if err != nil { fmt.Println("[Error] resolve UDP addr:", err); continue }
+			udpConn, err := net.ListenUDP("udp", udpAddr)
+			if err != nil { fmt.Println("[Error] listen UDP:", err); continue }
+			_ = udpConn.SetReadBuffer(4 << 20)
+			udpPort := udpConn.LocalAddr().(*net.UDPAddr).Port
 
-				// Create ephemeral UDP listener for this ONE transfer
-				udpAddr, err := net.ResolveUDPAddr("udp", ":0")
-				if err != nil { fmt.Println("[Error] resolve UDP addr:", err); continue }
-				udpConn, err := net.ListenUDP("udp", udpAddr)
-				if err != nil { fmt.Println("[Error] listen UDP:", err); continue }
-				_ = udpConn.SetReadBuffer(4 << 20)
-				udpPort := udpConn.LocalAddr().(*net.UDPAddr).Port
+			// Tell sender which UDP port to use (always include xferId)
+			startLine := fmt.Sprintf("START_UDP:%d:%s\n", udpPort, metadata.XferId)
+			if _, err := conn.Write([]byte(startLine)); err != nil {
+				fmt.Println("[Error] TCP write START_UDP:", err)
+				udpConn.Close()
+				continue
+			}
 
-				// Tell sender which UDP port to use
-				if _, err := conn.Write([]byte(fmt.Sprintf("START_UDP:%d\n", udpPort))); err != nil {
-					fmt.Println("[Error] TCP write START_UDP:", err)
+			// Receive chunks over UDP; ACKs go back on this same TCP socket
+			fileDataChan := make(chan []byte, 1)
+			done := make(chan struct{}, 1)
+			go func() {
+				combined := StartUDPReceiverConn(udpConn, metadata, conn, done)
+				fileDataChan <- combined
+			}()
+
+			// Wait for receive to finish (or timeout)
+			select {
+			case combined := <-fileDataChan:
+				if combined == nil && metadata.Size > 0 {
+					fmt.Println("[logs] receive failed (nil data)")
 					udpConn.Close()
+					_, _ = conn.Write([]byte("error:receive_failed\n"))
 					continue
 				}
-
-				// Receive chunks over UDP; ACKs go back on this same TCP socket
-				fileDataChan := make(chan []byte, 1)
-				done := make(chan struct{}, 1)
-
-				go func() {
-					combined := StartUDPReceiverConn(udpConn, metadata, conn, done)
-					fileDataChan <- combined
-				}()
-
-				// Wait for receive to finish (or timeout)
-				select {
-				case <-done:
-					combined := <-fileDataChan
-					if combined == nil && metadata.Size > 0 {
-						fmt.Println("[logs] receive failed (nil data)")
-						_, _ = conn.Write([]byte("error:receive_failed\n"))
-						udpConn.Close()
-						continue
-					}
-					_, _ = conn.Write([]byte("STOP_UDP\n"))
-					udpConn.Close()
-					go notifyFastAPI(metadata, combined)
-					fmt.Println("[logs] file delivered; keeping TCP open")
-
-				case <-time.After(120 * time.Second):
-					fmt.Println("[logs] timeout waiting for file data")
-					udpConn.Close()
-					_, _ = conn.Write([]byte("error:timeout\n"))
-				}
-				continue
+				udpConn.Close()
+				go notifyFastAPI(metadata, combined)
+				fmt.Println("[logs] file delivered; keeping TCP open")
+			case <-time.After(120 * time.Second):
+				fmt.Println("[logs] timeout waiting for file data")
+				udpConn.Close()
+				_, _ = conn.Write([]byte("error:timeout\n"))
+			}
+			continue
 			}
 		}
 
 		// Unknown line — ignore and continue (don’t kill the socket)
 		fmt.Printf("[Error] unrecognized line (neither identity, text, nor JSON file meta): %q\n", line)
-		// continue
+		continue
 	}
 }
 

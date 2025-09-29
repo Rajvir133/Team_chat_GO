@@ -5,12 +5,14 @@ import (
 	"bytes"
 	"compress/zlib"
 	"crypto/sha256"
+	"crypto/rand"
+    "encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net"
+	"path/filepath"
 	"strings"
 	"time"
-	"path/filepath"
 
 	"go_files/config"
 )
@@ -24,7 +26,7 @@ func Send_TCP(msg config.Message, conn net.Conn) error {
 	reader := bufio.NewReader(conn)
 	writer := bufio.NewWriter(conn)
 
-	// ---------- TEXT (pipe format): sender|receiver|text|message ----------
+	// ---------- TEXT (pipe format): sender|receiver|text|TEXT|<DeviceTag> ----------
 	if strings.EqualFold(msg.MessageType, "TEXT") {
 		line := pipeEscape(msg.Sender) + "|" +
 			pipeEscape(msg.Receiver) + "|" +
@@ -35,13 +37,6 @@ func Send_TCP(msg config.Message, conn net.Conn) error {
 		if _, err := writer.WriteString(line); err != nil {
 			return fmt.Errorf("failed to write text line: %v", err)
 		}
-
-		fmt.Println(strings.Repeat("-", 50))
-		fmt.Println(strings.Repeat(" ", 50))
-		fmt.Printf("Metadata Payload  %s\n", line)
-		fmt.Println(strings.Repeat(" ", 50))
-		fmt.Println(strings.Repeat("-", 50))
-
 		if err := writer.Flush(); err != nil {
 			return fmt.Errorf("failed to flush text line: %v", err)
 		}
@@ -49,22 +44,26 @@ func Send_TCP(msg config.Message, conn net.Conn) error {
 		return nil
 	}
 
-	// ---------- FILE (pipe metadata + UDP data) ----------
+	// ---------- FILE (UNIFIED: JSON header over TCP + UDP datagrams + END_UDP) ----------
 	if len(msg.Payload) == 0 {
 		return fmt.Errorf("[logs] file transfer requested but payload is empty")
 	}
 	file := msg.Payload[0]
 	rawBytes := file.Data
 
-	// Compression (skipped for certain types)
+	// Compression (skip for certain MIME types)
 	var compressed []byte
 	if config.NoCompressionTypes[file.Type] {
 		compressed = rawBytes
 	} else {
 		var buf bytes.Buffer
 		w := zlib.NewWriter(&buf)
-		_, _ = w.Write(rawBytes)
-		_ = w.Close()
+		if _, err := w.Write(rawBytes); err != nil {
+			return fmt.Errorf("zlib write: %w", err)
+		}
+		if err := w.Close(); err != nil {
+			return fmt.Errorf("zlib close: %w", err)
+		}
 		compressed = buf.Bytes()
 	}
 
@@ -73,24 +72,30 @@ func Send_TCP(msg config.Message, conn net.Conn) error {
 	chunks := config.CalculateChunks(len(compressed))
 	fileExt := strings.TrimPrefix(filepath.Ext(file.Name), ".")
 
-	// NEW: JSON header
-	type tcpMeta struct {
-		Sender       string `json:"sender"`
-		Receiver     string `json:"receiver"`
-		FileName     string `json:"file_name"`
-		FileType     string `json:"file_type"`
-		FileExt      string `json:"file_ext"`
-		FileSize     int    `json:"file_size"`
-		FileChecksum string `json:"file_checksum"`
-		TotalChunks  int    `json:"total_chunks"`
-		Host         string `json:"host"`
-		Transport    string `json:"transport"`
+	// Unified JSON header
+	type unifiedMeta struct {
+		From      string `json:"from"`
+		To        string `json:"to"`
+		Type      string `json:"type"`
+		Name      string `json:"name"`
+		Ext       string `json:"ext"`
+		Size      int    `json:"size"`
+		Checksum  string `json:"checksum"`
+		Transport string `json:"transport"`
+		XferId    string `json:"xferId"`
+		Marker    string `json:"marker"`
 	}
-	hdr := tcpMeta{
-		Sender: msg.Sender, Receiver: msg.Receiver,
-		FileName: file.Name, FileType: file.Type, FileExt: fileExt,
-		FileSize: len(compressed), FileChecksum: hashHex, TotalChunks: chunks,
-		Host: config.Device_type, Transport: "UDP",
+	hdr := unifiedMeta{
+		From:      msg.Sender,
+		To:        msg.Receiver,
+		Type:      file.Type,
+		Name:      file.Name,
+		Ext:       fileExt,
+		Size:      len(compressed),
+		Checksum:  hashHex,            // sha256 of EXACT bytes sent
+		Transport: "UDP",
+		XferId:    generateXferID(),   // 32-hex
+		Marker:    config.Device_type, // "BMS" etc.
 	}
 	b, _ := json.Marshal(hdr)
 	metaLine := string(b) + "\n"
@@ -98,23 +103,17 @@ func Send_TCP(msg config.Message, conn net.Conn) error {
 	if _, err := writer.WriteString(metaLine); err != nil {
 		return fmt.Errorf("write metadata (json): %v", err)
 	}
-	fmt.Println(strings.Repeat("-", 50))
-	fmt.Println(strings.Repeat(" ", 50))
-	fmt.Printf("Metadata JSON  %s\n", metaLine)
-	fmt.Println(strings.Repeat(" ", 50))
-	fmt.Println(strings.Repeat("-", 50))
-
 	if err := writer.Flush(); err != nil {
 		return fmt.Errorf("flush metadata: %v", err)
 	}
 
-	// --- Wait for Start:<port>, skipping identity/heartbeat noise
+	// --- Wait for START_UDP:<port>[:<xferId>], skipping identity + heartbeats
 	var startLine string
 	_ = conn.SetReadDeadline(time.Now().Add(15 * time.Second))
 	for {
 		line, err := reader.ReadString('\n')
 		if err != nil {
-			return fmt.Errorf("[logs] failed to read Start line: %v", err)
+			return fmt.Errorf("[logs] failed to read START_UDP line: %v", err)
 		}
 		line = strings.TrimSpace(line)
 
@@ -123,7 +122,7 @@ func Send_TCP(msg config.Message, conn net.Conn) error {
 			break
 		}
 
-		// Identity (tag|host) while we wait? Record & ignore.
+		// Identity (tag|host): accept but ignore while waiting
 		if i := strings.Index(line, "|"); i > 0 {
 			tag := strings.TrimSpace(line[:i])
 			host := strings.TrimSpace(line[i+1:])
@@ -133,30 +132,37 @@ func Send_TCP(msg config.Message, conn net.Conn) error {
 					if peerHost == "" {
 						peerHost = conn.RemoteAddr().String()
 					}
-					OnIdentity(peerHost, host)
+					OnIdentity(peerHost, host, tag)
 				}
-				fmt.Printf("[handshake] ignoring identity line: %q\n", line)
 				continue
 			}
 		}
 
-		// Heartbeats
-		if line == "ALIVE" || line == "PONG" {
+		// Heartbeats/noise
+		if line == "KEEP_ALIVE" || line == "ALIVE" || line == "PING" || line == "PONG" {
 			continue
 		}
 
-		return fmt.Errorf("[logs] invalid Start line: %q", line)
+		return fmt.Errorf("[logs] invalid line while waiting START_UDP: %q", line)
 	}
 	_ = conn.SetReadDeadline(time.Time{})
 
-	// Parse UDP port
+	// Parse UDP port and echoed xferId (if provided)
 	var udpPort int
-	if _, err := fmt.Sscanf(startLine, "START_UDP:%d", &udpPort); err != nil {
-		return fmt.Errorf("[logs] could not parse UDP port from %q: %v", startLine, err)
+	var echoedXfer string
+	parts := strings.Split(startLine, ":")
+	if len(parts) < 2 || parts[0] != "START_UDP" {
+		return fmt.Errorf("[logs] malformed START_UDP: %q", startLine)
 	}
-	fmt.Printf("[TCP] received start at %d\n", udpPort)
+	if _, err := fmt.Sscanf(parts[1], "%d", &udpPort); err != nil {
+		return fmt.Errorf("[logs] bad UDP port in %q: %v", startLine, err)
+	}
+	if len(parts) >= 3 {
+		echoedXfer = strings.ToLower(parts[2])
+	}
+	fmt.Printf("[TCP] received start at %d (xferId=%s)\n", udpPort, echoedXfer)
 
-	// UDP target = actual TCP peer IP (never rely on hostname here)
+	// UDP target = actual TCP peer IP
 	peerIP := func() string {
 		host, _, err := net.SplitHostPort(conn.RemoteAddr().String())
 		if err != nil {
@@ -165,39 +171,44 @@ func Send_TCP(msg config.Message, conn net.Conn) error {
 		return host
 	}()
 
-	if err := SendFileChunksUDP(conn, msg.Sender, peerIP, udpPort, hash, compressed, chunks); err != nil {
+	// Choose xferId to use (prefer echoed)
+	xfer := strings.ToLower(hdr.XferId)
+	if echoedXfer != "" {
+		xfer = echoedXfer
+	}
+
+	// Stream chunks (unified layout; ACKs read inside)
+	if err := SendFileChunksUDP(conn, msg.Sender, peerIP, udpPort, hash, compressed, chunks, xfer); err != nil {
 		return err
 	}
 
-	// --- Final status
-	_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-	stopLine, err := reader.ReadString('\n')
-	if err != nil {
-		return fmt.Errorf("read final line: %v", err)
+	// Unified finish: sender emits END_UDP:<xferId>; receiver doesn't send STOP_UDP
+	if _, err := writer.WriteString(fmt.Sprintf("END_UDP:%s\n", xfer)); err == nil {
+		_ = writer.Flush()
+	}
+
+	// Optional: brief window to catch error lines; otherwise success.
+	_ = conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if line, err := reader.ReadString('\n'); err == nil {
+		l := strings.TrimSpace(line)
+		switch l {
+		case "error:timeout":
+			return fmt.Errorf("receiver timeout waiting for chunks")
+		case "error:hash_mismatch":
+			return fmt.Errorf("receiver hash mismatch")
+		case "error:udp_read", "error:receive_failed":
+			return fmt.Errorf(l)
+		default:
+			// ignore any other noise
+		}
 	}
 	_ = conn.SetReadDeadline(time.Time{})
 
-	switch strings.TrimSpace(stopLine) {
-	case "STOP_UDP":
-		fmt.Println("[TCP] received stop")
-		fmt.Println("[log] sent successfully")
-	case "error:timeout":
-		return fmt.Errorf("receiver timeout waiting for chunks")
-	case "error:hash_mismatch":
-		return fmt.Errorf("receiver hash mismatch")
-	case "error:udp_read":
-		return fmt.Errorf("receiver experienced UDP read error")
-	case "error:receive_failed":
-		return fmt.Errorf("receiver failed during receive")
-	default:
-		return fmt.Errorf("unexpected final line: %q", stopLine)
-	}
+	fmt.Println("[log] sent successfully")
 	return nil
 }
 
-// We keep this JSON helper import to avoid go vet complaining about unused import
-// when you later remove JSON entirely. If you fully move to pipe-only, you can
-// delete the json import above.
+// Keep JSON helper to quiet vet if you later drop JSON entirely.
 var _ = json.Marshal
 
 // ----- helpers -----
@@ -209,4 +220,11 @@ func pipeEscape(s string) string {
 	s = strings.ReplaceAll(s, "\n", `\n`)
 	s = strings.ReplaceAll(s, "\r", `\r`)
 	return s
+}
+
+
+func generateXferID() string {
+    b := make([]byte, 16) // 16 bytes -> 32 hex chars
+    _, _ = rand.Read(b)
+    return hex.EncodeToString(b)
 }

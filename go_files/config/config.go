@@ -10,7 +10,7 @@ import (
 const (
 	HTTPPort             = 8080
 	TCPPort              = 9000
-	ChunkSize            = 11768 // change this size from 32 kb to 22kb
+	ChunkSize            = 1200 
 	AckTimeoutMs         = 10000
 	MaxRetries           = 3
 	Max_connection_retry = 3
@@ -52,16 +52,18 @@ type FilePayload struct {
 // FileMetadata contains file details before sending
 type FileMetadata struct {
 	Name     string `json:"name"`
-	Type     string `json:"type"` // file_type
-	Ext      string `json:"ext"`  // file_extension
+	Type     string `json:"type"` // MIME or logical type
+	Ext      string `json:"ext"`
 	Size     int    `json:"size"`
-	Chunks   int    `json:"chunks"` // Total_chunks
-	Hash     string `json:"hash"`
+	Chunks   int    `json:"chunks"`
+	Hash     string `json:"hash"` // sha256 of EXACT bytes sent
 	Sender   string `json:"sender"`
 	Receiver string `json:"receiver"`
 	Host     string `json:"host"`
 	Message  string `json:"message"`
+	XferId   string `json:"xferId"` // 32-hex transfer id (mandatory in unified mode)
 }
+
 
 // ======== Utility ========
 func CalculateChunks(fileSize int) int {

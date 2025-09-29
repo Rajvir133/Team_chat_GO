@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"strings"
 
 	"go_files/config"
 	"go_files/transfer"
@@ -42,9 +43,12 @@ func getAnyConn(ip string) (net.Conn, bool) {
 
 func main() {
 	// 🔗 wire identity -> registry
-	transfer.OnIdentity = func(remoteIP, hostname string) {
-		rememberPeer(remoteIP, hostname)
-	}
+	transfer.OnIdentity = func(remoteIP, hostname, tag string) {
+    rememberPeerWithTag(remoteIP, hostname, tag)
+    if strings.EqualFold(tag, "CMK") {
+        markAndroidPeer(remoteIP, true)
+    }
+}
 
 	transfer.SetOnConnReady(func(ip string, conn net.Conn) {
 		storeIncomingConn(ip, conn)

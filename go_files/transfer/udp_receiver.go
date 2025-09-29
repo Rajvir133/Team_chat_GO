@@ -1,10 +1,14 @@
 package transfer
 
 import (
+	"bufio"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
+	"bytes"
 	"fmt"
 	"net"
+	"strings"
 	"time"
 
 	"go_files/config"
@@ -12,94 +16,94 @@ import (
 
 
 func StartUDPReceiverConn(udpConn *net.UDPConn, metadata config.FileMetadata, conn net.Conn, done chan struct{}) []byte {
+	defer func() { select { case done <- struct{}{}: default: } }()
+
+	// Unified protocol:
+	// Datagram = [16B xferId] [u32 seq (0-based)] [u16 len] [payload]
+	// ACK      = "ACK_UDP:<xferId>:<seq>\n"
+	// Finish   = sender later writes "END_UDP:<xferId>" on TCP (we don't need to send anything)
+
+	idBytes, err := hex.DecodeString(strings.ToLower(metadata.XferId))
+	if err != nil || len(idBytes) != 16 {
+		fmt.Println("[udp] invalid xferId")
+		_, _ = conn.Write([]byte("error:invalid_xferid\n"))
+		return nil
+	}
 
 	fileBytes := make([]byte, metadata.Size)
-	received := make([]bool, metadata.Chunks+1)
+	maxPayload := config.ChunkSize
+	expected := metadata.Chunks
+	received := make([]bool, expected) // 0-based
 	receivedCount := 0
 
+	rxBuf := make([]byte, 16+4+2+maxPayload)
+	ackW := bufio.NewWriter(conn)
+	defer ackW.Flush()
+
 	idleStart := time.Now()
-    maxIdle := time.Duration(config.AckTimeoutMs*2) * time.Millisecond
+	idleTimeout := 20 * time.Second
 
-
-    for receivedCount < metadata.Chunks {
-        buf := make([]byte, 44+config.ChunkSize)
-        _ = udpConn.SetReadDeadline(time.Now().Add(5 * time.Second))
-
-        n, _, err := udpConn.ReadFromUDP(buf)
-        if err != nil {
-            if ne, ok := err.(net.Error); ok && ne.Timeout() {
-
-                if time.Since(idleStart) < maxIdle {
-                    continue
-                }
-                fmt.Println("[logs] UDP idle timeout; not all chunks received")
-                _, _ = conn.Write([]byte("error:timeout\n"))
-                select { case done <- struct{}{}: default: }
-                return nil
-            }
-            fmt.Println("[!] UDP read error:", err)
-            _, _ = conn.Write([]byte("error:udp_read\n"))
-            select { case done <- struct{}{}: default: }
-            return nil
-        }
-
-        idleStart = time.Now()
-
-        if n < 44 {
-            continue
-        }
-
-		// Header layout:
-		// [0:32]   SHA-256 of the (whole) file (ignored per-chunk; final check below)
-		// [32:36]  chunk index (1-based)
-		// [36:40]  total chunks
-		// [40:44]  chunk size (payload length)
-		idx := int(binary.BigEndian.Uint32(buf[32:36]))
-		total := int(binary.BigEndian.Uint32(buf[36:40]))
-		size := int(binary.BigEndian.Uint32(buf[40:44]))
-
-		// Basic sanity
-		if total != metadata.Chunks || idx <= 0 || idx > metadata.Chunks || size < 0 {
+	for {
+		_ = udpConn.SetReadDeadline(time.Now().Add(3 * time.Second))
+		n, _, err := udpConn.ReadFromUDP(rxBuf)
+		if err != nil {
+			if time.Since(idleStart) > idleTimeout {
+				fmt.Println("[udp] idle timeout")
+				return nil
+			}
+			continue
+		}
+		idleStart = time.Now()
+		if n < 22 { // header min
 			continue
 		}
 
-		payload := buf[44:n]
-		if len(payload) < size {
-			// truncated packet; skip
+		// Check xferId
+		if !bytes.Equal(rxBuf[:16], idBytes) {
 			continue
 		}
-		// Copy into destination at offset
-		offset := (idx - 1) * config.ChunkSize
+
+		seq := int(binary.BigEndian.Uint32(rxBuf[16:20])) // 0-based
+		size := int(binary.BigEndian.Uint16(rxBuf[20:22]))
+		if size < 0 || size > maxPayload || 22+size > n {
+			continue
+		}
+		if seq < 0 || seq >= expected {
+			continue
+		}
+
+		offset := seq * maxPayload
 		end := offset + size
 		if end > len(fileBytes) || offset < 0 {
 			continue
 		}
-		if !received[idx] {
-			copy(fileBytes[offset:end], payload[:size])
-			received[idx] = true
+
+		if !received[seq] {
+			copy(fileBytes[offset:end], rxBuf[22:22+size])
+			received[seq] = true
 			receivedCount++
 		}
 
-		// Per-chunk ACK back on TCP control channel
-		_, _ = conn.Write([]byte(fmt.Sprintf("chunk%d\n", idx)))
-		// fmt.Println("chunk received ----------- %d\n",idx)
+		// Unified ACK
+		if _, err := ackW.WriteString(fmt.Sprintf("ACK_UDP:%s:%d\n", strings.ToLower(metadata.XferId), seq)); err == nil {
+			_ = ackW.Flush()
+		}
+
+		if receivedCount >= expected {
+			break
+		}
 	}
 
-	// Final end-to-end hash check (matches sender’s metadata.Hash)
-	hasher := sha256.New()
-	hasher.Write(fileBytes)
-	ok := fmt.Sprintf("%x", hasher.Sum(nil)) == metadata.Hash
-
-	// ALWAYS signal done (non-blocking) to avoid deadlocks upstream
-	select { case done <- struct{}{}: default: }
-
-	if ok {
-		fmt.Println("[logs] Hash verification successful")
-		return fileBytes
+	// Final SHA-256 check
+	sum := sha256.Sum256(fileBytes)
+	got := strings.ToLower(hex.EncodeToString(sum[:]))
+	want := strings.ToLower(metadata.Hash)
+	if got != want {
+		fmt.Printf("[logs] hash mismatch: got=%s want=%s\n", got, want)
+		_, _ = conn.Write([]byte("error:hash_mismatch\n"))
+		return nil
 	}
-	fmt.Println("[logs] hash mismatch")
-	_, _ = conn.Write([]byte("error:hash_mismatch\n"))
-	return nil
+	return fileBytes
 }
 
 func StartUDPReceiver(port int, metadata config.FileMetadata, conn net.Conn, done chan bool) []byte {
@@ -110,7 +114,6 @@ func StartUDPReceiver(port int, metadata config.FileMetadata, conn net.Conn, don
 		return nil
 	}
 	udpConn, err := net.ListenUDP("udp", udpAddr)
-	_ = udpConn.SetReadBuffer(4 << 20)
 	if err != nil {
 		fmt.Println("[!] listen UDP:", err)
 		select { case done <- true: default: }
@@ -118,16 +121,16 @@ func StartUDPReceiver(port int, metadata config.FileMetadata, conn net.Conn, don
 	}
 	defer udpConn.Close()
 
+	// Bigger socket buffer helps at higher rates
+	_ = udpConn.SetReadBuffer(4 << 20) // 4 MiB
+
+	// Drive the connection-level handler and wait for it to signal completion
 	doneStruct := make(chan struct{}, 1)
 	data := StartUDPReceiverConn(udpConn, metadata, conn, doneStruct)
 
-	select {
-	case <-doneStruct:
-		select { case done <- true: default: }
-	default:
-	
-		select { case done <- true: default: }
-	}
+	// Always propagate completion to the caller's 'done' channel
+	<-doneStruct
+	select { case done <- true: default: }
 
 	return data
 }
