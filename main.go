@@ -10,10 +10,14 @@ import (
 
 func main() {
 	
+
 	gin.SetMode(gin.ReleaseMode)
 	router := gin.Default()
 
 	router.Use(config.SetupCORS())
+
+	router.GET("/scan", ScanNetwork)
+	router.GET("/fetch_connection", FetchConnections)
 
 	fmt.Println("----------------------------------------")
 	go func() {
